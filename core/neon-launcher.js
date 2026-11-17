@@ -12,6 +12,7 @@ let child;
 let watcher;
 let syncTimer;
 let retryTimer;
+let fallbackInterval;
 let syncInProgress = false;
 let syncRequested = false;
 let stopping = false;
@@ -140,6 +141,7 @@ async function syncSnapshot() {
         for (const filePath of walkFiles(dataDir)) {
             const relativePath = toRelativePath(filePath);
             if (!relativePath) continue;
+            currentPaths.add(relativePath);
             let content;
             try {
                 content = fs.readFileSync(filePath);
@@ -148,7 +150,6 @@ async function syncSnapshot() {
                 continue;
             }
             const sha256 = crypto.createHash('sha256').update(content).digest('hex');
-            currentPaths.add(relativePath);
             if (knownHashes.get(relativePath) === sha256) continue;
             changedRows.push({ relativePath, content, sha256 });
         }
@@ -197,7 +198,7 @@ async function syncSnapshot() {
         syncInProgress = false;
         if (syncRequested) {
             syncRequested = false;
-            scheduleSync(0);
+            if (!stopping) scheduleSync(0);
         }
     }
 }
@@ -209,6 +210,12 @@ function scheduleSync(delay = 250) {
         syncTimer = null;
         void syncSnapshot();
     }, delay);
+}
+
+async function waitForActiveSync() {
+    while (syncInProgress) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
 }
 
 function waitForChildExit(timeoutMs = 12000) {
@@ -231,10 +238,13 @@ async function shutdown(signal, exitCode = 0) {
     clearTimeout(syncTimer);
     clearTimeout(retryTimer);
     if (watcher) watcher.close();
+    if (fallbackInterval) clearInterval(fallbackInterval);
     log(`Received ${signal}; stopping the application and saving runtime data.`);
     if (child && child.exitCode === null) child.kill(signal);
     await waitForChildExit();
+    await waitForActiveSync();
     await syncSnapshot();
+    await waitForActiveSync();
     if (pool) await pool.end().catch(error => log('Database pool close failed', error));
     process.exit(exitCode);
 }
@@ -246,11 +256,11 @@ async function main() {
         watcher = fs.watch(dataDir, { recursive: true }, () => scheduleSync());
         watcher.on('error', error => {
             log('Filesystem watcher failed; periodic scanning is enabled.', error);
-            if (!syncTimer) scheduleSync(10000);
+            if (!fallbackInterval) fallbackInterval = setInterval(() => scheduleSync(0), 10000);
         });
     } catch (error) {
         log('Filesystem watcher unavailable; periodic scanning is enabled.', error);
-        setInterval(() => scheduleSync(0), 10000).unref();
+        fallbackInterval = setInterval(() => scheduleSync(0), 10000);
     }
 
     await syncSnapshot();
