@@ -334,6 +334,14 @@ function startAdminServer(dataProvider) {
   provider = dataProvider;
   app = express();
   app.set("trust proxy", true);
+  const expectedEdgeToken = process.env.CF_ORIGIN_TOKEN;
+  app.use((req, res, next) => {
+    if (req.path === "/api/health") return next();
+    if (!expectedEdgeToken || req.get("x-farm-edge-token") === expectedEdgeToken) {
+      return next();
+    }
+    return res.sendStatus(404);
+  });
   app.use(express.json({ limit: "256kb" }));
   registerMengkaNtBridge(app);
 
