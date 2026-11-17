@@ -34,6 +34,7 @@ COPY core/package.json ./core/
 COPY web/package.json ./web/
 
 RUN pnpm -C core install --prod --frozen-lockfile
+RUN npm install --prefix /app/neon-deps --no-save --ignore-scripts pg@8.16.3
 
 # ==========================================
 
@@ -51,6 +52,7 @@ RUN apk add --no-cache tzdata && \
 
 COPY --from=prod-deps /app/node_modules ../node_modules/
 COPY --from=prod-deps /app/core/node_modules ./node_modules/
+COPY --from=prod-deps /app/neon-deps /app/neon-deps
 COPY --from=prod-deps /app/package.json ../package.json
 
 COPY --from=builder /app/core ./
@@ -62,7 +64,7 @@ VOLUME ["/app/core/data"]
 
 EXPOSE 3007
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD wget -q --spider http://localhost:3007/api/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD wget -q --spider "http://127.0.0.1:${PORT:-3007}/api/health" || exit 1
 
-CMD ["node", "client.js"]
+CMD ["node", "neon-launcher.js"]
