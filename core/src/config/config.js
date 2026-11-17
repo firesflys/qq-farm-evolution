@@ -27,7 +27,7 @@ const CONFIG = {
     farmCheckIntervalMax: 12000,       // 农场检查最大间隔 12秒
     friendCheckIntervalMin: 12000,     // 好友检查最小间隔 12秒
     friendCheckIntervalMax: 15000,     // 好友检查最大间隔 15秒
-    adminPort: Number(process.env.ADMIN_PORT),
+    adminPort: Number(process.env.ADMIN_PORT || process.env.PORT),
     adminPassword: process.env.ADMIN_PASSWORD
 };
 

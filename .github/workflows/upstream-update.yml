@@ -1,0 +1,68 @@
+name: Check upstream updates
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream changes
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/Xb-Fishing/qq-farm-evolution.git
+          git fetch upstream main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c automation/upstream-sync
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "No upstream commits are missing from main."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-ff --no-edit upstream/main; then
+            git merge --abort || true
+            echo "::error::Upstream changes conflict with this fork. Resolve the merge manually."
+            exit 1
+          fi
+
+          git push --force-with-lease origin automation/upstream-sync
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update review pull request
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing_pr=$(gh pr list --base main --head automation/upstream-sync --state open --json number --jq 'length')
+          if [ "$existing_pr" = "0" ]; then
+            gh pr create \
+              --base main \
+              --head automation/upstream-sync \
+              --title "chore: review upstream updates" \
+              --body "This pull request merges changes from Xb-Fishing/qq-farm-evolution into this fork. Review the diff and checks before merging. Conflicts stop the workflow and require manual resolution."
+          else
+            echo "Updated the existing upstream review pull request."
+          fi
