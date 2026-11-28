@@ -31,8 +31,6 @@ export interface LoginLinks {
   logoUrl: string
   title: string
   loginSubtitle: string
-  registerSubtitle: string
-  purchaseUrl: string
   qqGroupUrl: string
 }
 
@@ -42,7 +40,7 @@ interface UseAdminSystemConfigOptions {
 
 const defaultSystemConfigValues: SystemConfig = {
   serverUrl: 'wss://gate-obt.nqf.qq.com/prod/ws',
-  clientVersion: '1.13.0.5_20260723',
+  clientVersion: '1.17.0.4_20261117',
   platform: 'qq',
   os: 'iOS',
 }
@@ -70,8 +68,6 @@ const defaultLoginLinks: LoginLinks = {
   logoUrl: '',
   title: 'QQ农场智能助手',
   loginSubtitle: '欢迎回来，开启智慧农耕之旅',
-  registerSubtitle: '创建账号，开启智慧农耕之旅',
-  purchaseUrl: '',
   qqGroupUrl: '',
 }
 

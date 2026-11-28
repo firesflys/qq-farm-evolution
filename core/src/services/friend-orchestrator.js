@@ -26,6 +26,7 @@ if (globalThis.process?.env?.FARM_SESSION_BUSINESS === '1') {
   // eslint-disable-next-line no-func-assign -- Preserve the hoisted function and its existing recursive callers.
   watchlistPollTick = require('./business-state').wrapBusinessFunction('services/friend-orchestrator.js:watchlistPollTick', watchlistPollTick);
 }
+const { parentPort } = require('node:worker_threads');
 const { CONFIG } = require('../config/config');
 const {
   isAutomationOn,
@@ -36,6 +37,7 @@ const {
   getKnownFriendGids,
   applyConfigSnapshot,
   getFriendBadRetryDate,
+  saveFriendBadRetryDate,
   readFriendDogInfoCache,
   getPauseRemainMs,
 } = require('../models/store');
@@ -94,9 +96,10 @@ const {
   clearAllInvalidKnownFriendGidCooldown,
 } = require('./friend-api');
 const {
+  BAD_SHARED_OPERATION_ID,
   checkDailyReset,
-  canOperate,
   canOperateBad,
+  getOperationLimits,
   getCanGetHelpExp,
   getHelpAutoDisabledByLimit,
   updateOperationLimits,
@@ -285,10 +288,11 @@ async function dispatchDueCacheStealTargets(targets, { myGid, preEnter = null, s
   const accountId = process.env.FARM_ACCOUNT_ID || '';
   const dispatched = new Set();
   const tally = { steal: 0, water: 0, weed: 0, bug: 0, putBug: 0, putWeed: 0 };
-  if (targets.length > 0 && canOperate(0x2714)) {
+  // Harvest eligibility comes from the target farm. The daily insect-placement counter is unrelated.
+  if (targets.length > 0) {
     require('./request-governor').setContentionMode(true, Date.now() + 60_000);
     for (const target of targets) {
-      if (seq !== friendReadLifecycleSeq || !canOperate(0x2714) || ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS)) break;
+      if (seq !== friendReadLifecycleSeq || ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS)) break;
       const targetPreEnter = preEnter && Number(preEnter.gid) === Number(target.gid)
         ? preEnter
         : null;
@@ -741,11 +745,21 @@ async function bootstrapFriendDogInfoCacheIfNeeded() {
   }
 }
 
-function syncAutomationPatchToMaster(patch) {
-  postToMaster({
-    type: 'automation_patch',
-    patch,
-  });
+function setFriendBadPause(retryDate) {
+  const accountId = process.env.FARM_ACCOUNT_ID || '';
+  const managed = Boolean(process.send || parentPort || process.env.FARM_WORKER === '1'
+    || process.env.FARM_SESSION_BUSINESS === '1');
+  const patch = { friendBadRetryDate: retryDate };
+  // Keep the account's pause durable even when the session host has no manager.
+  saveFriendBadRetryDate(retryDate, accountId);
+  applyConfigSnapshot(patch, { accountId, persist: !managed });
+  if (!managed || process.connected === false) return;
+  const message = { type: 'automation_patch', patch };
+  if (typeof process.send === 'function') {
+    try { process.send(message, () => {}); } catch { /* The date is already saved for this account. */ }
+  } else {
+    postToMaster(message);
+  }
 }
 
 function resetBadFailureCount() {
@@ -762,13 +776,8 @@ function getLocalDateKey(offsetDays = 0) {
 }
 
 function pauseFriendBadUntilTomorrow(reason) {
-  const accountId = process.env.FARM_ACCOUNT_ID || '';
   const retryDate = getLocalDateKey(1);
-  applyConfigSnapshot(
-    { friendBadRetryDate: retryDate },
-    { accountId }
-  );
-  syncAutomationPatchToMaster({ friendBadRetryDate: retryDate });
+  setFriendBadPause(retryDate);
   resetBadFailureCount();
   log('好友', `捣乱连续失败 ${BAD_FAILURE_LIMIT} 次，已暂停至 ${retryDate} 再尝试。最后错误: ${reason || '未知'}`, {
     module: 'friend',
@@ -786,8 +795,7 @@ function isFriendBadPaused() {
   if (!retryDate) return false;
   if (getLocalDateKey() < retryDate) return true;
 
-  applyConfigSnapshot({ friendBadRetryDate: '' }, { accountId });
-  syncAutomationPatchToMaster({ friendBadRetryDate: '' });
+  setFriendBadPause('');
   resetBadFailureCount();
   return false;
 }
@@ -919,11 +927,11 @@ async function checkFriends(options = {}) {
       const dueWatches = getDueWatchFriends().filter((w) =>
         w.gid && w.gid !== userState.gid && !fastBlacklist.has(w.gid)
       );
-      if (dueWatches.length > 0 && canOperate(0x2714)) {
+      if (dueWatches.length > 0) {
         placeholderOwner.phase = 'visit';
         const tally = { steal: 0, water: 0, weed: 0, bug: 0, putBug: 0, putWeed: 0 };
         for (const target of dueWatches) {
-          if (roundSeq !== friendReadLifecycleSeq || !canOperate(0x2714) || ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS)) break;
+          if (roundSeq !== friendReadLifecycleSeq || ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS)) break;
           const targetPreEnter = preEnter && Number(preEnter.gid) === Number(target.gid)
             ? preEnter
             : null;
@@ -1128,7 +1136,7 @@ async function checkFriends(options = {}) {
       // 避免这些预期失败累计进异常降速阈值；请求预算和进门预算保持不变。
       require('./request-governor').setContentionMode(true, Date.now() + 60_000);
       for (const target of stealTargets) {
-        if (roundSeq !== friendReadLifecycleSeq || !canOperate(0x2714) || ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS)) break; // 10004 = steal
+        if (roundSeq !== friendReadLifecycleSeq || ownHarvestIsImminent(OWN_HARVEST_RESERVE_MS)) break;
         const targetPreEnter = preEnter && Number(preEnter.gid) === Number(target.gid) ? preEnter : null;
         let result = null;
         try {
@@ -1557,12 +1565,27 @@ async function runBadOnceOnStartup(force = false) {
   const accountId = process.env.FARM_ACCOUNT_ID || '';
   const label = force ? '开启自动捣乱后立即执行' : '启动时放虫放草';
 
-  log('好友', `========== ${label}开始 ==========`, {
-    module: 'friend',
-    event: `${label}开始`,
-  });
-
   try {
+    checkDailyReset();
+    if (canOperateBad() && !getOperationLimits()[BAD_SHARED_OPERATION_ID]) {
+      const { operation_limits: limits } = await require('./farm-api').getAllLands();
+      if (getPauseRemainMs(accountId) > 0) return;
+      // The farm read normally updates the cache through its registered callback.
+      if (!getOperationLimits()[BAD_SHARED_OPERATION_ID]) updateOperationLimits(limits);
+    }
+    if (!canOperateBad()) {
+      log('好友', `${label}跳过：今日放虫放草次数已用完`, {
+        module: 'friend',
+        event: '放虫放草次数用完',
+        processedCount: 0,
+      });
+      return;
+    }
+
+    log('好友', `========== ${label}开始 ==========`, {
+      module: 'friend',
+      event: `${label}开始`,
+    });
     const allFriendsReply = await getAllFriends();
     if (getPauseRemainMs(accountId) > 0) return;
     const rawFriends = extractReplyFriends(allFriendsReply);

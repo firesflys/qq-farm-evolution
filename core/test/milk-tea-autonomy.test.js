@@ -28,6 +28,7 @@ async function throughBridge(error) {
   const filename = path.resolve(__dirname, '../src/runtime/session-business-bridge.js');
   const module = { exports: {} }; const port = new EventEmitter(); const faults = [];
   const collaborators = {
+    './ranch-scene-binding': require('../src/runtime/ranch-scene-binding'),
     'node:events': { EventEmitter }, 'node:perf_hooks': require('node:perf_hooks'),
     // Only VM-created request envelopes need the host Object prototype. The
     // actual error/reply codec and bridge rejection path remain unchanged.
@@ -45,7 +46,7 @@ async function throughBridge(error) {
   };
   const bridge = module.exports.createSessionBusinessBridge({ port,
     gate: { operation: () => ({ connectionEpoch: 1 }), setAuthorityProvider() {} },
-    initialFacts: { sequence: 1, game: { connectionEpoch: 1, userState: {}, status: {}, clock: {} } },
+    initialFacts: { sequence: 1, host: { hostId: 'synthetic-ranch-host' }, game: { connected: true, connectionEpoch: 1, userState: {}, status: {}, clock: {} } },
     onControlFailure: value => faults.push(value),
   });
   try {
@@ -65,7 +66,7 @@ async function actualBudgetRejection(reason) {
     assert.equal(h.attempts.length, 0, 'governor rejection occurs before any physical socket send');
     const decoded = await throughBridge(error);
     assert.equal(decoded.isGovernedRejection, true); assert.equal(decoded.governedReason, reason);
-    assert.equal(decoded.isLocalRequestRejection, undefined, 'not a transferable proof');
+    assert.equal(decoded.isLocalRequestRejection, true, 'the bridge preserves the local marker; strict governed proof remains required');
     return decoded;
   } finally { await h.stop(); }
 }

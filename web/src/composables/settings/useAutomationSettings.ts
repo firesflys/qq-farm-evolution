@@ -14,6 +14,7 @@ const defaultAutomation = {
   harvest: false,
   plant: false,
   task: false,
+  dog_auto_feed: false,
   milk_tea_auto_rewards: false,
   milk_tea_auto_seeds: false,
   milk_tea_auto_work: false,
@@ -199,17 +200,6 @@ export function useAutomationSettings({
     const accountId = String(currentAccountId.value)
     const epoch = ++saveEpoch
     const active = () => !disposed && epoch === saveEpoch && String(currentAccountId.value) === accountId
-    const policy = localAutomationSettings.value.automation.milk_tea_seed_policy
-    const hirePolicy = localAutomationSettings.value.automation.milk_tea_hire_policy
-    if (localAutomationSettings.value.automation.milk_tea_auto_hire && (![1, 2, 3].includes(hirePolicy.durationId)
-      || [hirePolicy.ticketDailyLimit, hirePolicy.ticketReserve].some(value => !/^(?:0|[1-9]\d{0,19})$/.test(String(value))))) {
-      showAlert('请修正奶茶雇佣班次与预算后保存', 'danger')
-      return
-    }
-    if (localAutomationSettings.value.automation.milk_tea_auto_seeds && (!Number.isSafeInteger(policy.targetStock) || policy.targetStock < 0 || policy.targetStock > 9999 || [policy.coinReserve, policy.coinDailyLimit, policy.ticketReserve, policy.ticketDailyLimit].some(value => !/^(?:0|[1-9]\d{0,19})$/.test(String(value))))) {
-      showAlert('请修正奶茶购种库存目标与预算后保存', 'danger')
-      return
-    }
     automationSaving.value = true
     try {
       localAutoCodeRefresh.value.intervalMinutes = normalizeAutoCodeRefreshInterval(localAutoCodeRefresh.value.intervalMinutes)

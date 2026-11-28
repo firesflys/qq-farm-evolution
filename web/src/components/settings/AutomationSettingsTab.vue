@@ -10,6 +10,7 @@ interface AutomationSettings {
     farm: boolean
     harvest: boolean
     plant: boolean
+    dog_auto_feed?: boolean
     task: boolean
     sell: boolean
     friend: boolean
@@ -79,6 +80,7 @@ const emit = defineEmits<{
 
 const settings = defineModel<AutomationSettings>('settings', { required: true })
 const autoCodeRefresh = defineModel<AutoCodeRefreshConfig>('autoCodeRefresh', { required: true })
+const includeKickoutRelogin = defineModel<boolean>('includeKickoutRelogin', { default: false })
 
 function toLocalInputValue(d: Date) {
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -139,6 +141,7 @@ const mysteryShopSettingsVisible = ref(false)
         <BaseSwitch v-model="settings.automation.harvest" label="自动收菜" />
         <BaseSwitch v-model="settings.automation.plant" label="自动种菜" />
         <BaseSwitch v-model="settings.automation.task" label="自动做任务" />
+        <BaseSwitch v-model="settings.automation.dog_auto_feed" label="自动喂狗（不足 6 小时补 1 份现有狗粮）" />
         <BaseSwitch v-model="settings.automation.sell" label="自动卖果实" />
         <BaseSwitch v-model="settings.automation.friend" label="自动好友互动" />
         <BaseSwitch v-model="settings.automation.farm_push" label="推送触发巡田" />
@@ -278,8 +281,9 @@ const mysteryShopSettingsVisible = ref(false)
         </div>
       </div>
 
-      <div class="border border-gray-200 rounded bg-gray-50/70 p-3 dark:border-gray-700 dark:bg-gray-900/20">
-        <div class="space-y-2">
+      <div class="border border-gray-200 rounded bg-gray-50/70 p-3 space-y-2 dark:border-gray-700 dark:bg-gray-900/20">
+        <BaseSwitch v-if="templateMode" v-model="includeKickoutRelogin" label="将重登延迟纳入默认方案" />
+        <div v-if="!templateMode || includeKickoutRelogin" class="space-y-2">
           <span class="inline-flex items-center gap-1.5 text-sm text-gray-900 font-medium dark:text-gray-100">
             <span class="i-carbon-user-access text-base text-gray-500 dark:text-gray-400" />
             被顶号后自定义重登延迟

@@ -4,6 +4,7 @@ import { computed, onScopeDispose, ref, watch, watchEffect } from 'vue'
 import api from '@/api'
 import { useFarmStore } from '@/stores/farm'
 import { useSettingStore } from '@/stores/setting'
+import { defaultRequestPolicy } from '@/utils/request-policy'
 
 interface BagSeedItem {
   seedId: number
@@ -56,6 +57,7 @@ export function useStrategySettings({
     plantOrderRandom: false,
     plantDelaySeconds: 0,
     intervals: { farmMin: 8, farmMax: 12, helpMin: 30, helpMax: 35, stealMin: 25, stealMax: 30 },
+    requestPolicy: defaultRequestPolicy(),
     friendQuietHours: { enabled: false, start: '23:00', end: '07:00', minSleepMinutes: 1, maxSleepMinutes: 120, wakeBeforeMinutes: 66, watchlistWakeBeforeMinutes: 122, pauseUntil: '', idleProtectionEnabled: false },
   })
 
@@ -400,6 +402,7 @@ export function useStrategySettings({
         stealDelaySeconds: settings.value.stealDelaySeconds ?? 0,
         plantOrderRandom: !!settings.value.plantOrderRandom,
         plantDelaySeconds: settings.value.plantDelaySeconds ?? 0,
+        requestPolicy: settings.value.requestPolicy,
         intervals: settings.value.intervals,
         friendQuietHours: settings.value.friendQuietHours,
       }))

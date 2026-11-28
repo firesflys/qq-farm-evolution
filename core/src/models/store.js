@@ -1,3 +1,4 @@
+const { DEFAULT_REQUEST_POLICY, normalizeRequestPolicy, validateRequestPolicy } = require('../services/request-policy');
 const process = require('node:process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -14,7 +15,9 @@ const ACCOUNTS_FILE = getDataFile('accounts.json');
 const KNOWN_FRIEND_GIDS_DIR = getDataFile('known_friend_gids');
 const FRIEND_DOG_INFO_DIR = getDataFile('friend_dog_info');
 const FRIEND_LIST_CACHE_DIR = getDataFile('friend_list_cache');
+const FRIEND_BAD_RETRY_DIR = getDataFile('friend_bad_retry');
 const WATCHLIST_STATE_MIRROR_DIR = getDataFile('watchlist_state_mirror');
+const unsavedFriendBadRetries = new Map();
 
 // ==================== 缓存目录辅助 ====================
 
@@ -204,6 +207,11 @@ function deleteAccountCaches(accountId) {
     deleteFriendListCache(accountId);
     deleteFriendDogInfoCache(accountId);
     deleteKnownFriendGidsCache(accountId);
+    const file = friendBadRetryFile(accountId);
+    if (file) {
+        unsavedFriendBadRetries.delete(file);
+        try { fs.unlinkSync(file); } catch { }
+    }
 }
 
 // ==================== 允许的策略 ====================
@@ -256,6 +264,7 @@ const DEFAULT_AUTOMATION = {
     friend_bad: false,
     friend_golden_bug: false,
     task: true,
+    dog_auto_feed: false,
     milk_tea_auto_rewards: false,
     // 奶茶自主动作（购种/班次工作/升级/制作/雇佣/开店/喇叭）独立开关，默认全关；
     // 策略见 milk_tea_seed_policy / milk_tea_hire_policy
@@ -387,6 +396,7 @@ const DEFAULT_PLANT_BLACKLIST = [20002, 26739, 20059, 20065, 20064, 20060, 20061
 
 /** 默认账号配置 */
 const DEFAULT_ACCOUNT_CONFIG = {
+    requestPolicy: DEFAULT_REQUEST_POLICY,
     automation: DEFAULT_AUTOMATION,
     autoCodeRefresh: {
         enabled: false,
@@ -610,7 +620,7 @@ function cloneAccountConfig(config = DEFAULT_ACCOUNT_CONFIG) {
             auto[key] = normalizeFertilizerLandTypes(srcAuto[key], DEFAULT_FERTILIZER_LAND_TYPES);
             continue;
         }
-        if (['milk_tea_auto_seeds', 'milk_tea_auto_work', 'milk_tea_auto_upgrade', 'milk_tea_auto_craft', 'milk_tea_auto_hire', 'milk_tea_auto_open', 'milk_tea_auto_boost'].includes(key)) {
+        if (['dog_auto_feed', 'milk_tea_auto_seeds', 'milk_tea_auto_work', 'milk_tea_auto_upgrade', 'milk_tea_auto_craft', 'milk_tea_auto_hire', 'milk_tea_auto_open', 'milk_tea_auto_boost'].includes(key)) {
             auto[key] = srcAuto[key] === true;
             continue;
         }
@@ -645,6 +655,7 @@ function cloneAccountConfig(config = DEFAULT_ACCOUNT_CONFIG) {
             enabled: config.autoCodeRefresh && config.autoCodeRefresh.enabled === true,
             intervalMinutes: Math.max(1, Math.min(1440, Number(config.autoCodeRefresh && config.autoCodeRefresh.intervalMinutes) || 60))
         },
+        requestPolicy: normalizeRequestPolicy(config.requestPolicy),
         intervals: { ...config.intervals || DEFAULT_ACCOUNT_CONFIG.intervals },
         friendQuietHours: { ...config.friendQuietHours || DEFAULT_ACCOUNT_CONFIG.friendQuietHours },
         kickoutRelogin: { ...config.kickoutRelogin || DEFAULT_ACCOUNT_CONFIG.kickoutRelogin },
@@ -688,8 +699,6 @@ const DEFAULT_LOGIN_LINKS = {
     logoUrl: '',
     title: 'QQ农场智能助手',
     loginSubtitle: '欢迎回来，开启智慧农耕之旅',
-    registerSubtitle: '创建账号，开启智慧农耕之旅',
-    purchaseUrl: '',
     qqGroupUrl: ''
 };
 
@@ -737,12 +746,14 @@ function normalizeAccountConfig(raw, fallbackConfig = accountFallbackConfig) {
     const input = raw && typeof raw === 'object' ? raw : {};
     const cfg = cloneAccountConfig(fallbackConfig || DEFAULT_ACCOUNT_CONFIG);
 
+    cfg.requestPolicy = normalizeRequestPolicy(input.requestPolicy, cfg.requestPolicy);
+
     // 合并自动化配置
     if (input.automation && typeof input.automation === 'object') {
         for (const [key, value] of Object.entries(input.automation)) {
             if (!ALLOWED_AUTOMATION_KEYS.has(key)) continue;
 
-            if (['milk_tea_auto_seeds', 'milk_tea_auto_work', 'milk_tea_auto_upgrade', 'milk_tea_auto_craft', 'milk_tea_auto_hire', 'milk_tea_auto_open', 'milk_tea_auto_boost'].includes(key)) {
+            if (['dog_auto_feed', 'milk_tea_auto_seeds', 'milk_tea_auto_work', 'milk_tea_auto_upgrade', 'milk_tea_auto_craft', 'milk_tea_auto_hire', 'milk_tea_auto_open', 'milk_tea_auto_boost'].includes(key)) {
                 cfg.automation[key] = value === true;
             } else if (key === 'milk_tea_seed_policy') {
                 cfg.automation[key] = milkTeaPolicy.normalizeSeedPolicy(value, cfg.automation[key]);
@@ -902,6 +913,7 @@ function normalizeAccountConfig(raw, fallbackConfig = accountFallbackConfig) {
 
 function pickDefaultPlanConfig(raw) {
     const cfg = normalizeAccountConfig(raw, DEFAULT_ACCOUNT_CONFIG);
+    const relogin = raw?.kickoutRelogin;
     const automation = { ...cfg.automation };
     automation.milk_tea_seed_policy = milkTeaPolicy.cloneSeedPolicy(automation.milk_tea_seed_policy);
     automation.milk_tea_hire_policy = milkTeaPolicy.cloneHirePolicy(automation.milk_tea_hire_policy);
@@ -911,8 +923,13 @@ function pickDefaultPlanConfig(raw) {
         plantingStrategy: cfg.plantingStrategy,
         preferredSeedId: cfg.preferredSeedId,
         prioritize2x2Crops: cfg.prioritize2x2Crops === true,
+        requestPolicy: { ...cfg.requestPolicy },
         intervals: { ...cfg.intervals },
         friendQuietHours: { ...cfg.friendQuietHours },
+        ...(relogin && typeof relogin === 'object' && !Array.isArray(relogin)
+            && (Object.hasOwn(relogin, 'delayMinutes') || Object.hasOwn(relogin, 'validUntil'))
+            ? { kickoutRelogin: { ...cfg.kickoutRelogin } }
+            : {}),
         stealDelaySeconds: cfg.stealDelaySeconds,
         plantOrderRandom: cfg.plantOrderRandom,
         plantDelaySeconds: cfg.plantDelaySeconds,
@@ -1079,8 +1096,6 @@ function loadGlobalConfig() {
                 logoUrl: String(data.loginLinks.logoUrl ?? '').trim(),
                 title: String(data.loginLinks.title || DEFAULT_LOGIN_LINKS.title).trim(),
                 loginSubtitle: String(data.loginLinks.loginSubtitle || DEFAULT_LOGIN_LINKS.loginSubtitle).trim(),
-                registerSubtitle: String(data.loginLinks.registerSubtitle || DEFAULT_LOGIN_LINKS.registerSubtitle).trim(),
-                purchaseUrl: String(data.loginLinks.purchaseUrl ?? '').trim(),
                 qqGroupUrl: String(data.loginLinks.qqGroupUrl ?? '').trim()
             };
         }
@@ -1283,7 +1298,8 @@ function getConfigSnapshot(accountId) {
         plantingStrategy: cfg.plantingStrategy,
         preferredSeedId: cfg.preferredSeedId,
         prioritize2x2Crops: cfg.prioritize2x2Crops === true,
-        friendBadRetryDate: String(cfg.friendBadRetryDate || ''),
+        friendBadRetryDate: readFriendBadRetryDate(accountId) ?? String(cfg.friendBadRetryDate || ''),
+        requestPolicy: { ...cfg.requestPolicy },
         intervals: { ...cfg.intervals },
         friendQuietHours: { ...cfg.friendQuietHours },
         kickoutRelogin: { ...cfg.kickoutRelogin },
@@ -1313,11 +1329,12 @@ function applyConfigSnapshot(patch = {}, opts = {}) {
     const accountId = opts.accountId;
     const base = getAccountConfigSnapshot(accountId);
     const cfg = normalizeAccountConfig(base, accountFallbackConfig);
+    if (patch.requestPolicy !== undefined) cfg.requestPolicy = normalizeRequestPolicy(patch.requestPolicy, cfg.requestPolicy);
 
     if (patch.automation && typeof patch.automation === 'object') {
         for (const [key, value] of Object.entries(patch.automation)) {
             if (cfg.automation[key] === undefined) continue;
-            if (['milk_tea_auto_seeds', 'milk_tea_auto_work', 'milk_tea_auto_upgrade', 'milk_tea_auto_craft', 'milk_tea_auto_hire', 'milk_tea_auto_open', 'milk_tea_auto_boost'].includes(key)) {
+            if (['dog_auto_feed', 'milk_tea_auto_seeds', 'milk_tea_auto_work', 'milk_tea_auto_upgrade', 'milk_tea_auto_craft', 'milk_tea_auto_hire', 'milk_tea_auto_open', 'milk_tea_auto_boost'].includes(key)) {
                 cfg.automation[key] = value === true;
             } else if (key === 'milk_tea_seed_policy') {
                 cfg.automation[key] = milkTeaPolicy.normalizeSeedPolicy(value, cfg.automation[key]);
@@ -1460,6 +1477,7 @@ function setAutomation(key, value, accountId) {
     }
     const patch = { automation: { [key]: value } };
     if (key === 'friend_bad' && value === true) {
+        saveFriendBadRetryDate('', accountId, { required: true });
         patch.friendBadRetryDate = '';
     }
     return applyConfigSnapshot(patch, { accountId });
@@ -1500,8 +1518,39 @@ function getPrioritize2x2Crops(accountId) {
     return getAccountConfigSnapshot(accountId).prioritize2x2Crops === true;
 }
 
+function friendBadRetryFile(accountId) {
+    const id = resolveAccountId(accountId);
+    return id ? path.join(FRIEND_BAD_RETRY_DIR, `${Buffer.from(id).toString('base64url')}.json`) : '';
+}
+
+function saveFriendBadRetryDate(retryDate, accountId, { required = false } = {}) {
+    const file = friendBadRetryFile(accountId);
+    if (!file) return;
+    const value = { retryDate, updatedAt: Date.now() };
+    try {
+        writeJsonFileAtomic(file, value);
+        unsavedFriendBadRetries.delete(file);
+    } catch {
+        if (required) throw new Error('无法保存好友捣乱暂停状态');
+        // A full or unavailable disk must not cancel the live worker's pause.
+        unsavedFriendBadRetries.set(file, value);
+    }
+}
+
+function readFriendBadRetryDate(accountId) {
+    const file = friendBadRetryFile(accountId);
+    if (!file) return null;
+    const saved = readJsonFile(file, null);
+    const valid = saved && Number.isSafeInteger(saved.updatedAt)
+        && typeof saved.retryDate === 'string' && /^(?:\d{4}-\d{2}-\d{2})?$/.test(saved.retryDate);
+    const unsaved = unsavedFriendBadRetries.get(file);
+    if (unsaved && (!valid || unsaved.updatedAt >= saved.updatedAt)) return unsaved.retryDate;
+    if (unsaved) unsavedFriendBadRetries.delete(file);
+    return valid ? saved.retryDate : null;
+}
+
 function getFriendBadRetryDate(accountId) {
-    return String(getAccountConfigSnapshot(accountId).friendBadRetryDate || '');
+    return readFriendBadRetryDate(accountId) ?? String(getAccountConfigSnapshot(accountId).friendBadRetryDate || '');
 }
 
 function getBagSeedPriority(accountId) {
@@ -1950,7 +1999,7 @@ function getUserDefaultAccountPlan(username) {
         return {
             exists: false,
             enabled: true,
-            config: pickDefaultPlanConfig(DEFAULT_ACCOUNT_CONFIG),
+            config: pickDefaultPlanConfig(),
             updatedAt: 0
         };
     }
@@ -1959,6 +2008,7 @@ function getUserDefaultAccountPlan(username) {
 }
 
 function setUserDefaultAccountPlan(username, rawConfig, options = {}) {
+    if (rawConfig?.requestPolicy !== undefined) validateRequestPolicy(rawConfig.requestPolicy);
     const key = String(username || '').trim();
     if (!key) throw new Error('Missing username');
     const previousPlan = globalConfig.userDefaultAccountPlans[key];
@@ -1982,7 +2032,10 @@ function setUserDefaultAccountPlan(username, rawConfig, options = {}) {
 function applyUserDefaultAccountPlan(username, accountId) {
     const plan = getUserDefaultAccountPlan(username);
     if (!plan.exists) throw new Error('尚未保存默认方案');
-    setAccountConfigSnapshot(accountId, plan.config);
+    const currentConfig = getAccountConfigSnapshot(accountId);
+    const kickoutRelogin = plan.config.kickoutRelogin ?? currentConfig.kickoutRelogin;
+    // 默认方案只替换策略设置，保留账号独有的好友名单等数据。
+    setAccountConfigSnapshot(accountId, { ...currentConfig, ...plan.config, kickoutRelogin });
     return getConfigSnapshot(accountId);
 }
 
@@ -2087,8 +2140,6 @@ function setLoginLinks(config) {
         logoUrl: String(config?.logoUrl ?? current.logoUrl).trim(),
         title: String(config?.title || DEFAULT_LOGIN_LINKS.title).trim(),
         loginSubtitle: String(config?.loginSubtitle || DEFAULT_LOGIN_LINKS.loginSubtitle).trim(),
-        registerSubtitle: String(config?.registerSubtitle || DEFAULT_LOGIN_LINKS.registerSubtitle).trim(),
-        purchaseUrl: String(config?.purchaseUrl ?? current.purchaseUrl).trim(),
         qqGroupUrl: String(config?.qqGroupUrl ?? current.qqGroupUrl).trim()
     };
     saveGlobalConfig();
@@ -2324,6 +2375,7 @@ module.exports = {
     getPlantingStrategy,
     getPrioritize2x2Crops,
     getFriendBadRetryDate,
+    saveFriendBadRetryDate,
     getBagSeedPriority,
     getBagSeedFallbackStrategy,
     getIntervals,

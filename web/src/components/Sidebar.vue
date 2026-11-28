@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import type { Card } from '@/stores/user'
-import { useDateFormat, useIntervalFn, useNow } from '@vueuse/core'
+import { useDateFormat, useIntervalFn, useNow, useStorage } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -14,7 +13,7 @@ import { useAppStore } from '@/stores/app'
 import { useShopStore } from '@/stores/shop'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
-import { formatTimeDuration, getCardQuotaValue, useUserStore } from '@/stores/user'
+import { useUserStore } from '@/stores/user'
 
 const accountStore = useAccountStore()
 const statusStore = useStatusStore()
@@ -30,9 +29,15 @@ const { mysteryOffer, mysteryOfferAccountId } = storeToRefs(shopStore)
 const { loginPageConfig, sidebarOpen } = storeToRefs(appStore)
 
 const wsErrorNotifiedAt = ref<Record<string, number>>({})
-const hasUnadaptedActivities = ref(false)
-const unadaptedActivityIds = ref<number[]>([])
-const notifiedActivitySignature = ref('')
+const reminderOwner = computed(() => userStore.isAdmin ? userStore.username : '')
+const readActivityIds = useStorage<number[]>(() => `activity-read-ids:${reminderOwner.value}`, [], undefined, { writeDefaults: false, flush: 'sync' })
+const candidateIds = ref<number[]>([])
+const unreadActivityIds = computed(() => {
+  const read = new Set(Array.isArray(readActivityIds.value) ? readActivityIds.value : [])
+  return candidateIds.value.filter(id => !read.has(id))
+})
+let reminderRequest = 0
+let receivedReport = false
 const brandLogoFailed = ref(false)
 
 const systemConnected = ref(true)
@@ -85,30 +90,47 @@ async function refreshStatusFallback() {
   }
 }
 
-async function refreshActivityUpdateReminder() {
-  if (!userStore.isAdmin) {
-    hasUnadaptedActivities.value = false
-    return
-  }
-  try {
-    const { data } = await api.get('/api/activity/update/status')
-    const ids = Array.isArray(data?.report?.unknownActivityIds)
-      ? data.report.unknownActivityIds.map(Number).filter((id: number) => id > 0).sort((a: number, b: number) => a - b)
-      : []
-    unadaptedActivityIds.value = ids
-    hasUnadaptedActivities.value = ids.length > 0
-    const signature = ids.join(',')
-    if (signature && signature !== notifiedActivitySignature.value) {
-      notifiedActivitySignature.value = signature
-      const groups = Array.isArray(data?.report?.online?.groups) ? data.report.online.groups : []
-      const titles = [...new Set(groups.map((item: any) => String(item?.title || '').trim()).filter(Boolean))]
-      toast.warning(`发现未适配活动：${titles.join('、') || `${ids.length} 个活动组`}`, 8000)
-    }
-  }
-  catch {
-    // 提醒查询失败不影响侧边栏及其他后台功能。
+function markActivitiesRead() {
+  if (route.path === '/activity' && reminderOwner.value && unreadActivityIds.value.length) {
+    const prior = Array.isArray(readActivityIds.value) ? readActivityIds.value : []
+    readActivityIds.value = [...prior, ...unreadActivityIds.value]
   }
 }
+
+async function refreshActivityUpdateReminder() {
+  const owner = reminderOwner.value
+  if (!owner)
+    return
+  const request = ++reminderRequest
+  try {
+    const { data } = await api.get('/api/activity/update/status')
+    if (request !== reminderRequest || owner !== reminderOwner.value || data?.ok !== true
+      || !Array.isArray(data.report?.unknownActivityIds) || data.report?.online?.available === false) {
+      return
+    }
+    const reviewed = new Set<number>(Array.isArray(data.reviewedActivityIds) ? data.reviewedActivityIds.map(Number) : [])
+    const ids = [...new Set<number>(data.report.unknownActivityIds.map(Number))]
+      .filter(id => Number.isSafeInteger(id) && id > 0 && !reviewed.has(id))
+    const previous = new Set(candidateIds.value)
+    candidateIds.value = ids
+    markActivitiesRead()
+    const added = unreadActivityIds.value.filter(id => !previous.has(id))
+    if (receivedReport && added.length)
+      toast.warning(`新增 ${added.length} 个活动候选节点`, 8000)
+    receivedReport = true
+  }
+  catch {
+    // Keep the last successful report when polling fails.
+  }
+}
+
+watch(reminderOwner, () => {
+  reminderRequest++
+  receivedReport = false
+  candidateIds.value = []
+  void refreshActivityUpdateReminder()
+}, { immediate: true, flush: 'sync' })
+watch(() => route.path, markActivitiesRead)
 
 onMounted(() => {
   appStore.fetchLoginPageConfig()
@@ -118,7 +140,6 @@ onMounted(() => {
   userStore.fetchUserInfo()
   // 获取公告（普通用户）
   fetchAnnouncement()
-  refreshActivityUpdateReminder()
 })
 
 watch(() => loginPageConfig.value.logoUrl, () => {
@@ -126,6 +147,7 @@ watch(() => loginPageConfig.value.logoUrl, () => {
 })
 
 onBeforeUnmount(() => {
+  reminderRequest++
   statusStore.disconnectRealtime()
 })
 
@@ -222,6 +244,11 @@ const hasActiveMysteryOffer = computed(() => {
 
 const version = __APP_VERSION__
 
+function closeCurrentMenu(itemPath: string) {
+  if (route.path === itemPath && window.innerWidth < 1024)
+    appStore.closeSidebar()
+}
+
 watch(
   () => route.path,
   () => {
@@ -233,14 +260,6 @@ watch(
 
 // 用户相关
 const showUserDropdown = ref(false)
-const showRenewModal = ref(false)
-const renewCardCode = ref('')
-const renewLoading = ref(false)
-const renewError = ref('')
-const renewSuccess = ref(false)
-const renewCardInfo = ref<(Partial<Card> & { type: string, days: number, description: string }) | null>(null)
-const renewChecking = ref(false)
-
 // 公告相关
 const showAnnouncementModal = ref(false)
 const showAnnouncementViewModal = ref(false)
@@ -265,75 +284,6 @@ const tokenCopied = ref(false)
 async function handleLogout() {
   await userStore.logout()
   router.push('/login')
-}
-
-async function checkCardInfo() {
-  if (!renewCardCode.value.trim()) {
-    renewError.value = '请输入卡密'
-    return
-  }
-  renewChecking.value = true
-  renewError.value = ''
-  renewCardInfo.value = null
-  try {
-    const res = await api.get(`/api/card/info/${renewCardCode.value.trim()}`)
-    if (res.data.ok) {
-      renewCardInfo.value = res.data.data
-    }
-    else {
-      renewError.value = res.data.error || '卡密不存在或已使用'
-    }
-  }
-  catch (e: any) {
-    renewError.value = e?.response?.data?.error || e?.message || '查询卡密失败'
-  }
-  finally {
-    renewChecking.value = false
-  }
-}
-
-async function handleRenew() {
-  if (!renewCardCode.value.trim()) {
-    renewError.value = '请输入卡密'
-    return
-  }
-  renewLoading.value = true
-  renewError.value = ''
-  renewSuccess.value = false
-  try {
-    const res = await userStore.renew(renewCardCode.value.trim())
-    if (res.ok) {
-      renewSuccess.value = true
-      renewCardCode.value = ''
-      renewCardInfo.value = null
-      setTimeout(() => {
-        showRenewModal.value = false
-        renewSuccess.value = false
-      }, 1500)
-    }
-    else {
-      renewError.value = res.error || '续费失败'
-    }
-  }
-  catch (e: any) {
-    renewError.value = e?.response?.data?.error || e?.message || '续费失败'
-  }
-  finally {
-    renewLoading.value = false
-  }
-}
-
-function openRenewModal() {
-  renewCardCode.value = ''
-  renewError.value = ''
-  renewSuccess.value = false
-  renewCardInfo.value = null
-  showRenewModal.value = true
-  showUserDropdown.value = false
-}
-
-function getDurationLabel(card: Parameters<typeof formatTimeDuration>[0]) {
-  return formatTimeDuration(card)
 }
 
 // 公告相关函数
@@ -459,6 +409,8 @@ async function copyToken() {
       </div>
       <!-- Mobile Close Button -->
       <button
+        type="button"
+        aria-label="关闭导航菜单"
         class="h-8 w-8 flex flex-none items-center justify-center rounded-lg text-gray-500 transition lg:hidden hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
         @click="appStore.closeSidebar"
       >
@@ -496,9 +448,6 @@ async function copyToken() {
                 >
                   {{ userStore.isAdmin ? '管理员' : '用户' }}
                 </span>
-                <span v-if="userStore.userCard" class="truncate text-xs text-gray-400">
-                  {{ getDurationLabel(userStore.userCard) }} {{ userStore.accountLimit }}额度
-                </span>
               </div>
             </div>
           </div>
@@ -520,18 +469,6 @@ async function copyToken() {
             <div class="text-xs text-gray-500 dark:text-gray-400">
               {{ userStore.isAdmin ? '管理员' : '普通用户' }}
             </div>
-            <div v-if="userStore.userCard" class="mt-1 text-xs">
-              <span class="text-gray-500">时长:</span>
-              <span class="ml-1" :style="{ color: 'var(--theme-primary)' }">{{ getDurationLabel(userStore.userCard) }}</span>
-              <span class="ml-3 text-gray-500">剩余额度:</span>
-              <span class="ml-1" :style="{ color: 'var(--theme-primary)' }">{{ userStore.accountLimit }}</span>
-            </div>
-            <div v-if="userStore.userCard" class="text-xs">
-              <span class="text-gray-500">过期时间:</span>
-              <span class="ml-1" :class="userStore.isExpired ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'">
-                {{ userStore.expireTimeText }}
-              </span>
-            </div>
           </div>
           <div class="py-1">
             <button
@@ -542,15 +479,6 @@ async function copyToken() {
             >
               <div class="i-carbon-notification" />
               <span>设置公告</span>
-            </button>
-            <button
-              v-if="!userStore.isAdmin"
-              class="w-full flex items-center gap-2 px-4 py-2 text-sm transition-colors hover:bg-gray-100/50 dark:hover:bg-gray-700/50"
-              :style="{ color: 'var(--theme-primary)' }"
-              @click="openRenewModal"
-            >
-              <div class="i-carbon-renew" />
-              <span>续费卡密/额度</span>
             </button>
             <button
               class="w-full flex items-center gap-2 px-4 py-2 text-sm text-red-600 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-900/20"
@@ -573,6 +501,7 @@ async function copyToken() {
         :active-class="item.path === '/' ? '' : 'router-link-active'"
         :exact-active-class="item.path === '/' ? 'router-link-active' : 'router-link-exact-active'"
         class="nav-item group relative flex items-center gap-3 rounded-xl px-2 py-1.5 transition-colors duration-200"
+        @click.left.exact="closeCurrentMenu(item.path)"
       >
         <span class="nav-icon h-9 w-9 flex flex-none items-center justify-center rounded-lg text-[22px] transition-colors duration-200">
           <div :class="[item.icon]" />
@@ -584,9 +513,9 @@ async function copyToken() {
           title="神秘商人已出现"
         />
         <span
-          v-if="item.path === '/activity' && hasUnadaptedActivities"
+          v-if="item.path === '/activity' && unreadActivityIds.length"
           class="h-2 w-2 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
-          :title="`发现 ${unadaptedActivityIds.length} 个未适配活动`"
+          :title="`${unreadActivityIds.length} 个未读活动候选节点`"
         />
       </router-link>
     </nav>
@@ -702,137 +631,6 @@ async function copyToken() {
     class="fixed inset-0 z-40 bg-transparent"
     @click="showUserDropdown = false"
   />
-
-  <!-- 续费卡密弹窗 -->
-  <div
-    v-if="showRenewModal"
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
-    @click.self="showRenewModal = false"
-  >
-    <div class="w-96 rounded-xl bg-white p-5 shadow-2xl dark:bg-gray-800" @click.stop>
-      <h3 class="mb-4 text-lg text-gray-900 font-bold dark:text-gray-100">
-        续费卡密
-      </h3>
-
-      <div v-if="userStore.userCard" class="mb-4 rounded-lg bg-gray-50 p-3 dark:bg-gray-700/50">
-        <div class="text-xs text-gray-500 dark:text-gray-400">
-          当前状态
-        </div>
-        <div class="mt-1 flex items-center justify-between">
-          <span class="text-sm text-gray-700 font-medium dark:text-gray-300">
-            时长: {{ getDurationLabel(userStore.userCard) }}
-          </span>
-          <span class="text-sm text-gray-700 font-medium dark:text-gray-300">
-            额度: {{ userStore.accountLimit }}个账号
-          </span>
-        </div>
-        <div class="mt-1 text-xs">
-          <span class="text-gray-500">过期时间:</span>
-          <span class="ml-1" :class="userStore.isExpired ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'">
-            {{ userStore.expireTimeText }}
-          </span>
-        </div>
-      </div>
-
-      <div class="mb-4">
-        <label class="mb-1.5 block text-sm text-gray-600 dark:text-gray-400">
-          卡密
-        </label>
-        <div class="flex gap-2">
-          <input
-            v-model="renewCardCode"
-            type="text"
-            placeholder="请输入卡密"
-            class="flex-1 border border-gray-200 rounded-lg bg-white px-3 py-2 text-sm dark:border-gray-600 focus:border-blue-500 dark:bg-gray-700 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-            :disabled="renewLoading || renewChecking"
-          >
-          <button
-            class="border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-600 transition dark:border-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
-            :disabled="renewLoading || renewChecking || !renewCardCode.trim()"
-            @click="checkCardInfo"
-          >
-            <div v-if="renewChecking" class="i-svg-spinners-90-ring-with-bg" />
-            <span v-else>查询</span>
-          </button>
-        </div>
-      </div>
-
-      <!-- 卡密信息预览 -->
-      <div v-if="renewCardInfo" class="mb-4 border border-blue-200 rounded-lg bg-blue-50 p-3 dark:border-blue-800 dark:bg-blue-900/20">
-        <div class="text-xs text-gray-500 dark:text-gray-400">
-          卡密信息
-        </div>
-        <div class="mt-2 space-y-2">
-          <div class="flex items-center justify-between">
-            <span class="text-sm text-gray-600 dark:text-gray-400">描述:</span>
-            <span class="text-sm text-gray-900 font-medium dark:text-white">{{ renewCardInfo.description }}</span>
-          </div>
-          <div class="flex items-center justify-between">
-            <span class="text-sm text-gray-600 dark:text-gray-400">类型:</span>
-            <span
-              class="inline-flex rounded-full px-2 text-xs font-semibold leading-5"
-              :class="renewCardInfo.type === 'quota' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200' : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'"
-            >
-              {{ renewCardInfo.type === 'quota' ? '额度卡' : '时间卡' }}
-            </span>
-          </div>
-          <div class="flex items-center justify-between">
-            <span class="text-sm text-gray-600 dark:text-gray-400">
-              {{ renewCardInfo.type === 'quota' ? '额度数量:' : '时长:' }}
-            </span>
-            <span class="text-sm text-gray-900 font-medium dark:text-white">
-              {{ renewCardInfo.type === 'quota' ? `+${getCardQuotaValue(renewCardInfo)}个账号额度` : getDurationLabel(renewCardInfo) }}
-            </span>
-          </div>
-        </div>
-        <div class="mt-3 rounded bg-white/50 p-2 text-xs text-gray-600 dark:bg-gray-800/50 dark:text-gray-400">
-          <template v-if="renewCardInfo.type === 'quota'">
-            使用后将增加 <span class="text-orange-600 font-medium">{{ getCardQuotaValue(renewCardInfo) }}</span> 个账号额度
-          </template>
-          <template v-else>
-            使用后将增加 <span class="text-blue-600 font-medium">{{ getDurationLabel(renewCardInfo) }}</span> 使用时长
-          </template>
-        </div>
-      </div>
-
-      <div v-if="renewError" class="mb-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-400">
-        {{ renewError }}
-      </div>
-
-      <div v-if="renewSuccess" class="mb-3 rounded-lg bg-green-50 px-3 py-2 text-sm text-green-600 dark:bg-green-900/20 dark:text-green-400">
-        续费成功！
-      </div>
-
-      <div class="flex justify-end gap-2">
-        <button
-          class="border border-gray-200 rounded-lg px-4 py-1.5 text-sm text-gray-600 transition dark:border-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
-          :disabled="renewLoading"
-          @click="showRenewModal = false"
-        >
-          取消
-        </button>
-        <button
-          v-if="!renewCardInfo"
-          class="rounded-lg px-4 py-1.5 text-sm text-white font-medium shadow transition disabled:cursor-not-allowed disabled:opacity-50 hover:opacity-90"
-          :style="{ backgroundColor: 'var(--theme-primary)' }"
-          :disabled="renewLoading || renewChecking || !renewCardCode.trim()"
-          @click="checkCardInfo"
-        >
-          查询卡密
-        </button>
-        <button
-          v-else
-          class="rounded-lg px-4 py-1.5 text-sm text-white font-medium shadow transition disabled:cursor-not-allowed disabled:opacity-50 hover:opacity-90"
-          :style="{ backgroundColor: 'var(--theme-primary)' }"
-          :disabled="renewLoading"
-          @click="handleRenew"
-        >
-          <div v-if="renewLoading" class="i-svg-spinners-90-ring-with-bg mr-1 inline-block align-text-bottom" />
-          确认使用
-        </button>
-      </div>
-    </div>
-  </div>
 
   <!-- 管理员设置公告弹窗 -->
   <div

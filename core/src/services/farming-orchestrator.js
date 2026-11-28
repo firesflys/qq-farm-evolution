@@ -542,6 +542,9 @@ async function runFarmOperation(opType, options = {}) {
         }
         actions.push(`一键务农${parts.join('/')}`);
         recordOperation('farming', farmingLandIds.length);
+        log('农场', `一键务农处理 ${farmingLandIds.length} 块地（${parts.join('/') || '无附加动作'}）`, {
+          module: 'farm', event: '一键务农', result: 'ok', count: farmingLandIds.length, logKind: 'action', automationCategory: 'farm',
+        });
         recordEvent(process.env.FARM_ACCOUNT_ID || '', 'info', 'farming',
           `一键务农：${parts.join('/') || '无动作'}`);
       } catch (err) {
@@ -555,7 +558,7 @@ async function runFarmOperation(opType, options = {}) {
 
   // ── 种植 ──
   if (opType === 'plant' || (opType === 'all' && isAutomationOn('plant'))) {
-    const emptyLands = [...new Set(analysis.empty)];
+    let emptyLands = [...new Set(analysis.empty)];
     let deadLands = [...new Set(analysis.dead)];
 
     // 收获后检查可铲除的地块
@@ -563,7 +566,8 @@ async function runFarmOperation(opType, options = {}) {
       await randomDelay(200, 800);
       if (automaticPaused()) return pausedResult();
       removeResult = await resolveRemovableHarvestedLands(harvestedLands, harvestResult);
-      deadLands = [...new Set([...deadLands, ...removeResult.removable])];
+      deadLands = [...new Set([...deadLands, ...removeResult.dead])];
+      emptyLands = [...new Set([...emptyLands, ...removeResult.empty])];
     }
 
     if (automaticPaused()) return pausedResult();

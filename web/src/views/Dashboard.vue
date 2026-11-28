@@ -12,8 +12,8 @@ import { useAccountStore } from '@/stores/account'
 import { useBagStore } from '@/stores/bag'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
-import { formatCouponAmount, formatGoldAmount, formatGoldBeanAmount } from '@/utils/number-format'
 import { AUTOMATION_CATEGORY_LABELS, AUTOMATION_LOG_EVENT_GROUPS, getDailyEventCategory } from '@/utils/automation-observability'
+import { formatCouponAmount, formatGoldAmount, formatGoldBeanAmount } from '@/utils/number-format'
 
 const statusStore = useStatusStore()
 const accountStore = useAccountStore()
@@ -157,6 +157,7 @@ const modules = [
   { label: '仓库', value: 'warehouse' },
   { label: '任务', value: 'task' },
   { label: '活动', value: 'activity' },
+  { label: '牧场', value: 'ranch' },
   { label: '系统', value: 'system' },
 ]
 
@@ -176,9 +177,10 @@ const events = [
   { label: '进入农场', value: '进入农场' },
   { label: '好友巡查', value: '好友巡查循环' },
   { label: '偷菜巡查', value: '偷菜巡查' },
+  { label: '一键务农', value: '一键务农' },
   { label: '农场巡查', value: '农场循环' },
   { label: '土地提醒', value: '土地推送通知' },
-  { label: '收获作物', value: '收获作物' },
+  { label: '收获作物', value: '收获作物,到点保护收获' },
   { label: '清理枯枝', value: '铲除植物' },
   { label: '种植种子', value: '种植种子' },
   { label: '选择种子', value: '选择种子' },
@@ -197,7 +199,7 @@ const events = [
   { label: '月卡礼包', value: 'month_card_gift' },
   { label: '邮箱领取', value: 'email_rewards' },
   { label: '图鉴奖励', value: '图鉴奖励' },
-  { label: '同气礼包', value: '同气连枝礼包' },
+  { label: '同气礼包', value: '同气连枝礼包,dog_skill_gift_claim' },
   { label: '收获后出售', value: '收获后出售' },
   { label: '偷菜后出售', value: '偷菜后出售' },
   { label: '出售成功', value: 'sell_success,sell_done' },
@@ -622,6 +624,7 @@ interface DailyEvent {
 }
 
 const dailyEvents = ref<DailyEvent[]>([])
+let dailyEventsRequestId = 0
 const dailyEventCategory = ref('')
 const dailyEventCategories = [{ label: '全部分类', value: '' }, ...Object.entries(AUTOMATION_CATEGORY_LABELS).map(([value, label]) => ({ label, value }))]
 const visibleDailyEvents = computed(() => dailyEvents.value.filter(event => !dailyEventCategory.value || getDailyEventCategory(event) === dailyEventCategory.value).slice().reverse())
@@ -632,7 +635,6 @@ watch(currentAccountId, () => {
 })
 const downloadingDailyEvents = ref(false)
 const downloadingStealEvents = ref(false)
-let dailyEventsRequestId = 0
 
 async function fetchDailyEvents() {
   if (!currentAccountId.value)
@@ -876,7 +878,24 @@ useIntervalFn(updateCountdowns, 1000)
 </script>
 
 <template>
-  <div class="flex flex-col gap-5 pt-1 md:pt-2">
+  <div v-if="currentStatusReady && status?.requestProfile?.policySupported" class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg bg-slate-100 px-4 py-3 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300" role="status">
+    <strong :class="status.requestProfile.enabled ? '' : 'text-red-600 dark:text-red-400'">当前连接通信限流：{{ status.requestProfile.enabled ? '已开启' : '已关闭' }}</strong>
+    <span>近 60 秒结算 {{ status.requestProfile.windowCount }} 次 · 好友 {{ status.requestProfile.friendCount }} 次</span>
+    <span v-if="status.requestProfile.watchModeActive">热点窗口：总量/好友 ×1.5，进门/读地 ×{{ status.requestProfile.watchModeBoost }}</span>
+    <span v-if="status.requestProfile.enabled">
+      总预算 {{ status.requestProfile.effectiveTotalLimit }}
+      <template v-if="status.requestProfile.rosterSize > 0">（{{ status.requestProfile.rosterSize }} 位好友）</template>
+      · 好友 {{ status.requestProfile.effectiveFriendLimit }} · 单接口 {{ status.requestProfile.perMethodLimit }}
+    </span>
+    <span v-if="status.requestProfile.enabled && status.sessionUpgrade && status.requestProfile.rosterSize === undefined">好友增量将在连接更新后生效</span>
+  </div>
+  <div v-if="currentStatusReady && status?.sessionUpgrade?.requiresRescan" class="mb-4 flex flex-wrap items-center justify-between gap-3 border border-amber-300 rounded-xl bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200" role="status">
+    <p>更新已保留旧游戏连接。新通信控制需要重新建立连接后生效。{{ currentAccount?.platform === 'wx' ? '请为此账号重新扫码，新授权会替换旧连接。' : '请更新登录码后重启此账号。' }}</p>
+    <BaseButton v-if="currentAccount?.platform === 'wx'" variant="secondary" @click="rescanFromHome">
+      重新扫码并更新连接
+    </BaseButton>
+  </div>
+  <div class="dashboard-content flex flex-col gap-5 pt-1 md:pt-2">
     <div
       v-if="slowdownActive"
       class="flex flex-wrap items-center justify-between gap-3 border border-amber-300 rounded-lg bg-amber-50 px-4 py-3 dark:border-amber-700 dark:bg-amber-900/20"
@@ -1080,11 +1099,11 @@ useIntervalFn(updateCountdowns, 1000)
       </div>
     </div>
 
-    <div class="flex flex-1 flex-col items-stretch gap-5 md:flex-row">
-      <div class="flex flex-1 flex-col gap-5 md:w-3/4">
-        <div class="ui-card-elevated flex flex-1 flex-col rounded-lg p-5 md:overflow-hidden">
-          <div class="mb-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-            <h3 class="flex items-center gap-2 text-lg font-medium">
+    <div class="dashboard-cards grid gap-5">
+      <div class="min-w-0 flex flex-col">
+        <div class="ui-card-elevated flex flex-1 flex-col rounded-lg p-5">
+          <div class="mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+            <h3 class="flex items-center gap-2 whitespace-nowrap text-lg font-medium">
               <div class="i-carbon-document" />
               <span>运行日志</span>
             </h3>
@@ -1093,28 +1112,28 @@ useIntervalFn(updateCountdowns, 1000)
               <BaseSelect
                 v-model="filter.module"
                 :options="modules"
-                class="w-32"
+                class="w-30 sm:w-32"
                 @change="onLogFilterChange"
               />
 
               <BaseSelect
                 v-model="filter.event"
                 :options="events"
-                class="w-32"
+                class="w-30 sm:w-32"
                 @change="onLogFilterChange"
               />
 
               <BaseSelect
                 v-model="filter.isWarn"
                 :options="logLevels"
-                class="w-32"
+                class="w-30 sm:w-32"
                 @change="onLogFilterChange"
               />
 
               <BaseInput
                 v-model="filter.keyword"
                 placeholder="关键词..."
-                class="w-32"
+                class="w-30 sm:w-32"
                 clearable
                 @keyup.enter="onLogSearchTrigger"
                 @clear="onLogSearchTrigger"
@@ -1150,7 +1169,7 @@ useIntervalFn(updateCountdowns, 1000)
                 运行账号后，这里会持续追加巡查、种植、任务和出售记录。
               </div>
             </div>
-            <div v-for="log in allLogs" :key="log.ts + log.msg" class="mb-1 break-all">
+            <div v-for="log in allLogs" :key="log.ts + log.msg" class="mb-1 break-words">
               <span class="mr-2 select-none text-gray-400">[{{ formatLogTime(log.time, log.ts) }}]</span>
               <span class="mr-2 rounded px-1.5 py-0.5 text-xs font-bold" :class="getLogTagClass(log.tag)">{{ log.tag }}</span>
               <span v-if="log.meta?.event" class="mr-2 rounded bg-blue-50 px-1.5 py-0.5 text-xs text-blue-500 dark:bg-blue-900/20 dark:text-blue-400">{{ getEventLabel(log.meta.event) }}</span>
@@ -1161,7 +1180,7 @@ useIntervalFn(updateCountdowns, 1000)
         </div>
       </div>
 
-      <div class="flex flex-col gap-5 md:w-1/4">
+      <div class="min-w-0 flex flex-col gap-5">
         <div class="ui-card flex flex-col rounded-lg p-5">
           <h3 class="mb-4 flex items-center gap-2 text-lg font-medium">
             <div class="i-carbon-hourglass" />
@@ -1257,7 +1276,7 @@ useIntervalFn(updateCountdowns, 1000)
         </div>
       </div>
 
-      <div v-if="watchlistRipe.length" class="ui-card rounded-lg p-5">
+      <div v-if="watchlistRipe.length" class="ui-card col-span-full min-w-0 rounded-lg p-5">
         <h3 class="mb-3 flex items-center gap-2 text-lg font-medium">
           <div class="i-carbon-star-filled text-yellow-500" />
           <span>重点监控</span>
@@ -1284,7 +1303,7 @@ useIntervalFn(updateCountdowns, 1000)
         </div>
       </div>
 
-      <div class="ui-card rounded-lg p-5">
+      <div class="ui-card col-span-full min-w-0 rounded-lg p-5">
         <h3 class="mb-3 flex items-center gap-2 text-lg font-medium">
           <div class="i-carbon-list-checked" />
           <span>今日事件</span>
@@ -1347,3 +1366,19 @@ useIntervalFn(updateCountdowns, 1000)
     @saved="onAccountSaved"
   />
 </template>
+
+<style scoped>
+.dashboard-content {
+  container: dashboard / inline-size;
+}
+
+.dashboard-cards {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@container dashboard (inline-size >= 48rem) {
+  .dashboard-cards {
+    grid-template-columns: minmax(0, 2fr) minmax(20rem, 1fr); /* 为双列统计卡预留宽度 */
+  }
+}
+</style>

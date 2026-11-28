@@ -143,18 +143,6 @@ function handleLogoFileChange(event: Event) {
             placeholder="欢迎回来，开启智慧农耕之旅"
           />
           <BaseInput
-            v-model="localLoginLinks.registerSubtitle"
-            label="注册提示语"
-            type="text"
-            placeholder="创建账号，开启智慧农耕之旅"
-          />
-          <BaseInput
-            v-model="localLoginLinks.purchaseUrl"
-            label="购买链接"
-            type="text"
-            placeholder="https://... 或 /renewal"
-          />
-          <BaseInput
             v-model="localLoginLinks.qqGroupUrl"
             label="QQ群链接"
             type="text"
@@ -235,7 +223,7 @@ function handleLogoFileChange(event: Event) {
             v-model="localSystemConfig.clientVersion"
             label="客户端版本"
             type="text"
-            placeholder="1.13.0.5_20260723"
+            placeholder="1.17.0.4_20261117"
             class="col-span-2"
           />
           <div class="flex flex-col gap-1.5">

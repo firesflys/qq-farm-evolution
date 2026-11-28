@@ -34,6 +34,8 @@ test.after(() => {
 const realUtils = require('../src/utils/utils');
 
 const SEED_ID = 20002; // 白萝卜：1x1，本地目录与植物配置都存在
+const UNKNOWN_SIZE_SEED_ID = 999998; // 合成商店商品，真实植物配置无对应行
+const TWO_BY_TWO_SEED_ID = 29003; // 星语铃花：Plant 显式配置 size: 2
 const GOODS_ID = 11;
 const PRICE = 3;
 
@@ -44,8 +46,13 @@ const state = {
   bag: new Map(),          // seedId -> count（购买入包、种下消耗，模拟服务端）
   shopGoods: [],           // ShopInfoReply goods_list 夹具
   shopInfoError: null,     // 商店不可用（触发本地回退）
+  removeReply: [],
+  removeError: null,
+  removeCalls: [],
+  shopReads: 0,
   buyError: null,          // BuyGoods 拒绝/超时注入
   buySeedId: undefined,
+  delivered: undefined,
   buyCalls: [],            // BuyGoods 边界真实解码后的 { goodsId, num, price }
   plantCalls: [],          // Plant 边界真实解码后的 { seedId, landIds }
   plantFailLands: new Set(),
@@ -81,7 +88,14 @@ require.cache[networkPath] = mockModule(networkPath, {
   // 上游传输边界：所有请求用真实 proto 解码，验真实发出数量。
   sendMsgAsync: async (serviceName, methodName, payload, _timeout, options) => {
     const { types } = require('../src/utils/proto');
+    if (serviceName === 'gamepb.plantpb.PlantService' && methodName === 'RemovePlant') {
+      const request = types.RemovePlantRequest.decode(payload);
+      state.removeCalls.push(request.land_ids.map(Number));
+      if (state.removeError) throw state.removeError;
+      return { body: types.RemovePlantReply.encode({ land: state.removeReply }).finish() };
+    }
     if (serviceName === 'gamepb.shoppb.ShopService' && methodName === 'ShopInfo') {
+      state.shopReads++;
       if (state.shopInfoError) throw state.shopInfoError;
       types.ShopInfoRequest.decode(payload);
       return {
@@ -101,14 +115,15 @@ require.cache[networkPath] = mockModule(networkPath, {
       if (state.buyError) throw state.buyError;
       const goods = state.shopGoods.find(entry => Number(entry.id) === goodsId);
       const itemSeedId = state.buySeedId ?? (Number(goods && goods.item_id) || SEED_ID);
-      if (num > 0) {
+      const delivered = state.delivered ?? num;
+      if (delivered > 0) {
         // 购买成功真实入包 + 限购计数推进
-        state.bag.set(itemSeedId, (state.bag.get(itemSeedId) || 0) + num);
+        state.bag.set(itemSeedId, (state.bag.get(itemSeedId) || 0) + delivered);
         if (goods) goods.bought_num = Number(goods.bought_num || 0) + num;
       }
       return {
         body: types.BuyGoodsReply.encode(types.BuyGoodsReply.create({
-          get_items: [{ id: itemSeedId, count: num }],
+          get_items: delivered ? [{ id: itemSeedId, count: delivered }] : [],
           cost_items: [{ id: 1, count: price * num }],
         })).finish(),
       };
@@ -185,8 +200,13 @@ function resetAll(opts = {}) {
   state.level = 200;
   state.bag = new Map();
   state.shopInfoError = null;
+  state.removeCalls = [];
+  state.removeError = null;
+  state.removeReply = [];
+  state.shopReads = 0;
   state.buyError = null;
   state.buySeedId = undefined;
+  state.delivered = undefined;
   state.buyCalls = [];
   state.plantCalls = [];
   state.plantFailLands = new Set();
@@ -214,6 +234,64 @@ async function callShop(landIds, gold) {
   const result = await service.plantFromShop(landIds, userState, undefined, state.account);
   return { result, userState };
 }
+
+test('只有占地未知的合成商品时，首次与模块重载后均不购买、不种植', async () => {
+  resetAll();
+  // 合成商店列表，仅验证候选筛选行为。
+  const { getPlantBySeedId } = require('../src/config/gameConfig');
+  assert.equal(getPlantBySeedId(UNKNOWN_SIZE_SEED_ID), undefined);
+  state.shopGoods[0].item_id = UNKNOWN_SIZE_SEED_ID;
+  let balance = 100;
+  let balanceReads = 0;
+  const userState = {
+    accountId: state.account,
+    level: state.level,
+    get gold() { balanceReads++; return balance; },
+    set gold(value) { balance = value; },
+  };
+  const firstService = await loadService();
+  const first = await firstService.plantFromShop([1, 2], userState, undefined, state.account);
+  const service = await reloadService();
+  const afterReload = await service.plantFromShop([1, 2], userState, undefined, state.account);
+
+  assert.equal(state.shopReads, 2);
+  assert.deepEqual(state.buyCalls, []);
+  assert.deepEqual(state.plantCalls, []);
+  assert.deepEqual(state.walletCorrections, []);
+  assert.equal(state.bagReads, 0, '无候选时无需读取背包或走本地回退');
+  assert.equal(balanceReads, 0);
+  assert.equal(balance, 100);
+  for (const result of [first, afterReload]) {
+    assert.deepEqual(result, { plantedLands: [], plantedCount: 0, occupiedCount: 0 });
+  }
+  assert.equal(service.getPlantSizeBySeedId(UNKNOWN_SIZE_SEED_ID), 0);
+});
+
+test('等级条件更高的未知占地和四格商品不参与单格补种，单格库存只补缺口', async () => {
+  resetAll();
+  state.shopGoods[0].conds = [{ type: 1, param: 2 }];
+  state.shopGoods.push(
+    { id: GOODS_ID + 1, item_id: UNKNOWN_SIZE_SEED_ID, price: 7, unlocked: true, conds: [{ type: 1, param: 41 }] },
+    { id: GOODS_ID + 2, item_id: TWO_BY_TWO_SEED_ID, price: 9, unlocked: true, conds: [{ type: 1, param: 50 }] },
+  );
+  state.bag.set(SEED_ID, 1);
+
+  const { result, userState } = await callShop([1, 2], 100);
+
+  assert.equal(state.shopReads, 1);
+  assert.deepEqual(state.buyCalls, [{ goodsId: GOODS_ID, num: 1, price: PRICE }]);
+  assert.deepEqual(state.plantCalls, [
+    { seedId: SEED_ID, landIds: [1] },
+    { seedId: SEED_ID, landIds: [2] },
+  ]);
+  assert.deepEqual(result, { plantedLands: [1, 2], plantedCount: 2, occupiedCount: 2 });
+  assert.equal(state.bagReads, 1);
+  assert.equal(state.bag.size, 0);
+  assert.equal(userState.gold, 100 - PRICE);
+  const service = await loadService();
+  assert.equal(service.getPlantSizeBySeedId(SEED_ID), 1);
+  assert.equal(service.getPlantSizeBySeedId(TWO_BY_TWO_SEED_ID), 2);
+});
 
 test('购买成功但全部 Plant 失败：第二轮与模块重载后都复用已购库存，只买一次', async () => {
   resetAll();
@@ -517,4 +595,68 @@ test('购买回包改变实际种子ID时，不把原种子的库存算给另一
   assert.deepEqual(state.plantCalls, [{ seedId: 20001, landIds: [1] }]);
   assert.equal(state.bag.get(SEED_ID), 1, '原种子的库存不被混算或消费');
   assert.equal(round.userState.gold, 1000 - PRICE);
+});
+
+test('铲除未确认时排除整株四格作物，其他空地继续；新快照确认空地后恢复', async () => {
+  resetAll();
+  const service = await loadService();
+  const lands = [{ id: 5, slave_land_ids: [1, 2, 6] }, { id: 3, unlocked: true }];
+  state.removeError = new Error('fixture remove timeout');
+  let result = await service.autoPlantEmptyLands([5], [], lands);
+  assert.deepEqual(state.removeCalls, [[5]]);
+  assert.deepEqual([state.shopReads, state.bagReads, state.buyCalls.length, state.plantCalls.length], [0, 0, 0, 0]);
+  assert.equal(result.removedCount, 0);
+
+  state.bag.set(SEED_ID, 6);
+  result = await service.autoPlantEmptyLands([5], [3], lands);
+  assert.deepEqual(result.plantedLands, [3]);
+  assert.deepEqual(state.buyCalls, []);
+
+  state.removeError = null;
+  state.removeReply = [{ id: 5, unlocked: true }];
+  result = await service.autoPlantEmptyLands([5, 9], [], lands);
+  assert.equal(result.removedCount, 1);
+  assert.deepEqual([...result.plantedLands].sort((a, b) => a - b), [1, 2, 5, 6]);
+  assert.deepEqual(state.plantCalls.flatMap(call => call.landIds).filter(id => id === 9), []);
+  result = await service.autoPlantEmptyLands([], [9], [{ id: 9, unlocked: true }]);
+  assert.deepEqual(result.plantedLands, [9]);
+});
+
+test('收获回包区分已清空与需要铲除的地块', async () => {
+  await loadService();
+  const { resolveRemovableHarvestedLands } = require('../src/services/farm-land-analyzer');
+  const { PlantPhase } = require('../src/config/config');
+  const land = [{ id: 1, unlocked: true }, { id: 2, plant: { phases: [{ phase: PlantPhase.DEAD, begin_time: 1 }] } }];
+  const result = await resolveRemovableHarvestedLands([1, 2], { land });
+  assert.deepEqual(result.empty, [1]);
+  assert.deepEqual(result.dead, [2]);
+});
+
+test('限购用尽仍种植已持有的高等级种子，库存耗尽后才按策略回退', async () => {
+  resetAll({ limitCount: 2, boughtNum: 2 });
+  state.shopGoods[0].conds = [{ type: 1, param: 2 }];
+  state.shopGoods.push({ id: GOODS_ID + 1, item_id: 20001, price: 1, unlocked: true, conds: [] });
+  state.bag.set(SEED_ID, 2);
+  let round = await callShop([1, 2, 3], 100);
+  assert.equal(round.result.plantedCount, 2);
+  assert.deepEqual(state.plantCalls.map(x => x.seedId), [SEED_ID, SEED_ID]);
+  assert.deepEqual(state.buyCalls, []);
+  assert.equal(state.bagReads, 1);
+
+  round = await callShop([3], 100);
+  assert.equal(round.result.plantedCount, 1);
+  assert.deepEqual(state.buyCalls, [{ goodsId: GOODS_ID + 1, num: 1, price: 1 }]);
+  assert.equal(state.bagReads, 2);
+});
+
+test('购买只到账一部分或缺少入包回执时，仅按确认数量种植', async () => {
+  for (const delivered of [1, 0]) {
+    resetAll();
+    state.bag.set(SEED_ID, 1);
+    state.delivered = delivered;
+    const { result } = await callShop([1, 2, 3, 4], 100);
+    assert.deepEqual(state.buyCalls.map(row => row.num), [3]);
+    assert.equal(result.plantedCount, 1 + delivered);
+    assert.equal(state.plantCalls.length, 1 + delivered);
+  }
 });

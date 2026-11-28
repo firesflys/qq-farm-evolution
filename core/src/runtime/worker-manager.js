@@ -565,13 +565,13 @@ function createWorkerManager(deps) {
     /**
      * 重启账号 Worker
      */
-    function restartWorker(account) {
-        if (!account) return;
+    function restartWorker(account, { isCurrent = () => true } = {}) {
+        if (!account || !isCurrent()) return false;
         const accountId = account.id;
         if (persistentMode) return (async () => {
             await stopPersistentSession(accountId);
             const latest = findAccount(accountId);
-            return latest ? await startWorker(latest) : false;
+            return latest && isCurrent() ? await startWorker(latest) : false;
         })();
         const wrk = workers[accountId];
 
@@ -584,6 +584,7 @@ function createWorkerManager(deps) {
         const doRestart = () => {
             if (restarted) return;
             restarted = true;
+            if (!isCurrent()) return false;
             const current = workers[accountId];
             // 只有当前记录仍是本代次（或已无记录）时才清 restart_fallback，
             // 避免另一个旧重启回调取消新代次已挂的同名定时器
@@ -599,6 +600,7 @@ function createWorkerManager(deps) {
         };
 
         const forceKill = () => {
+            if (!isCurrent()) return false;
             const current = workers[accountId];
             if (!current || current.process !== targetProc) return false;
             try { current.process.kill(); } catch { }
@@ -635,6 +637,10 @@ function createWorkerManager(deps) {
         if (msg.type === 'status_sync') {
             // 状态同步
             wrk.status = normalizeStatusForPanel(msg.data, accountId, wrk.name);
+            if (wrk.process?.persistentSession) wrk.status.sessionUpgrade = {
+                requiresRescan: wrk.process.sessionFacts?.game?.requestPolicy?.supported !== true,
+                requestPolicy: wrk.process.sessionFacts?.game?.requestPolicy || null,
+            };
             if (typeof onStatusSync === 'function') {
                 onStatusSync(accountId, wrk.status, wrk.name);
             }
@@ -991,7 +997,20 @@ function createWorkerManager(deps) {
         // Revoke the canonical fence synchronously, even without a proxy record.
         if (account) deps.store.addOrUpdateAccount({ id: accountId }, { revokeSession: true });
         try {
-            if (wrk?.process?.persistentSession) await wrk.process.kill();
+            if (wrk?.process?.persistentSession) {
+                try {
+                    await wrk.process.kill();
+                } catch (error) {
+                    if (!account) throw error;
+                    // A terminal host may have exited before its proxy observed the exit.
+                    // Allow a restart only after the registry and lock confirm it is gone.
+                    const registry = require('./session-registry');
+                    const found = registry.descriptorFor(dataDir, account);
+                    const hostGone = found.state === 'absent' || (found.state === 'stale'
+                        && !registry.processIsLive(found.descriptor?.pid, found.descriptor?.starttime));
+                    if (!hostGone || registry.lockIsHeld(found.paths.lock)) throw error;
+                }
+            }
             else if (account) {
                 const found = await require('./session-registry').connectSession(dataDir, account);
                 if (found.state === 'present') {

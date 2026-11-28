@@ -12,15 +12,15 @@ test('strict version envelope rejects unrelated data, stale changed versions and
  for(const value of [{...envelope(),accountId:'other'},{...envelope(),platform:'qq'},{...envelope(),schema:2},{...envelope(),serverUrl:'untrusted'},{...envelope(),revision:-1},{...envelope(),clientVersion:'arbitrary'}]) assert.throws(()=>prepareClientRuntime(value,context),/校验/);
  assert.throws(()=>prepareClientRuntime(envelope(1,'1.17.0.1_20261108'),context),{code:'SESSION_CLIENT_VERSION_STALE'});
  assert.equal(prepareClientRuntime(undefined,context),null);
- assert.equal(prepareClientRuntime(envelope(21),{...context,currentVersion:'1.17.0.1_20261108'}).apply,false,'server upgrade is not downgraded');
+ assert.equal(prepareClientRuntime(envelope(21),{...context,currentVersion:'1.18.0.1_20300101'}).apply,false,'server upgrade is not downgraded');
  assert.ok(compareClientVersions('1.16.3.8_20261028',old)>0);assert.equal(compareClientVersions('1.16.3_20261028','1.16.3.0_20261028'),0);
 });
 async function adapterFixture(savedVersion=old){
  const file=path.resolve(__dirname,'../src/runtime/session-game-adapter.js');const req=createRequire(file);const socket={readyState:1};const calls=[];
  const account={id:'fixture-account',platform:'wx',sessionGeneration:'fixture-binding'};const config={CONFIG:{clientVersion:old,platform:'qq'},updateRuntimeConfig:value=>{assert.deepEqual(Object.keys(value),['clientVersion']);config.CONFIG.clientVersion=value.clientVersion;calls.push(['version',value.clientVersion]);}};
- let fail=false;const store={getSystemConfig:()=>({clientVersion:savedVersion}),getAccounts:()=>({accounts:[account]}),getFriendQuietHours:()=>({}),applyConfigSnapshot:(value)=>{if(fail)throw Error('synthetic store failure');assert.equal(Object.hasOwn(value,'__clientRuntime'),false);calls.push(['store',value]);}};
+ let fail=false;const store={getConfigSnapshot:()=>({requestPolicy:{enabled:true,total60s:80,friend60s:80,method60s:30}}),getSystemConfig:()=>({clientVersion:savedVersion}),getAccounts:()=>({accounts:[account]}),getFriendQuietHours:()=>({}),applyConfigSnapshot:(value)=>{if(fail)throw Error('synthetic store failure');assert.equal(Object.hasOwn(value,'__clientRuntime'),false);calls.push(['store',value]);}};
  const network={networkEvents:new EventEmitter(),getWs:()=>socket,isConnected:()=>true,getUserState:()=>({}),setSessionTransportHooks(){},stopNetwork(){throw Error('must not close connection');},connect(){throw Error('must not reconnect');}};
- const replacements={'../utils/network':network,'../config/config':config,'../models/store':store,'../services/stats':{},'../services/status':{setStatusPlatform(){},setRecordGoldExpHook(){}},'../services/request-governor':{},'../utils/idle-protection':{setIdleProtectionUntil(){}},'../utils/utils':{setLogHook(){},getServerClockSnapshot:()=>({})},'../utils/proto':{loadProto:async()=>{},getRoot:()=>({})}};
+ const replacements={'../utils/network':network,'../config/config':config,'../models/store':store,'../services/stats':{},'../services/status':{setStatusPlatform(){},setRecordGoldExpHook(){}},'../services/request-governor':req('../services/request-governor'),'../utils/idle-protection':{setIdleProtectionUntil(){}},'../utils/utils':{setLogHook(){},getServerClockSnapshot:()=>({})},'../utils/proto':{loadProto:async()=>{},getRoot:()=>({})}};
  replacements['../services/status'].setRecordGoldExpHook=()=>{};
  const mod={exports:{}};vm.runInNewContext(fs.readFileSync(file,'utf8'),{module:mod,exports:mod.exports,require:name=>Object.hasOwn(replacements,name)?replacements[name]:req(name),Buffer,process,queueMicrotask},{filename:file});
  const adapter=await mod.exports.createSessionGameAdapter({account});return{adapter,config,calls,socket,fail:value=>{fail=value;},network};

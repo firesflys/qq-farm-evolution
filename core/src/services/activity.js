@@ -5,6 +5,8 @@ if (globalThis.process?.env?.FARM_SESSION_BUSINESS === '1') {
   getActivityGroup = require('./business-state').wrapBusinessFunction('services/activity.js:getActivityGroup', getActivityGroup);
   // eslint-disable-next-line no-func-assign -- Preserve the hoisted function and its existing recursive callers.
   listActivityGroups = require('./business-state').wrapBusinessFunction('services/activity.js:listActivityGroups', listActivityGroups);
+  // eslint-disable-next-line no-func-assign -- Keep both reads within one tracked operation.
+  getSweetPotatoActivity = require('./business-state').wrapBusinessFunction('services/activity.js:getSweetPotatoActivity', getSweetPotatoActivity);
   // eslint-disable-next-line no-func-assign -- Preserve the hoisted function and its existing recursive callers.
   getActivityDiscoveryList = require('./business-state').wrapBusinessFunction('services/activity.js:getActivityDiscoveryList', getActivityDiscoveryList);
   // eslint-disable-next-line no-func-assign -- Preserve the hoisted function and its existing recursive callers.
@@ -86,6 +88,7 @@ if (globalThis.process?.env?.FARM_SESSION_BUSINESS === '1') {
  * - 原始 protobuf 回退解码
  */
 const protobuf = require('protobufjs/minimal');
+const Long = require('long');
 const { sendMsgAsync, getUserState, isConnected } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { toNum } = require('../utils/utils');
@@ -96,9 +99,7 @@ const { getBag, getBagItems } = require('./warehouse');
 const activityLogger = createModuleLogger('activity');
 const bearActivity = require('./season-bear-activity');
 const seasonWishActivities = require('./season-wish-activities');
-// 奶茶热销中（S4）只引纯标准化部分：本模块不反向依赖 activity.js 的运行期函数
-// （milk-tea-activity.js 在函数内延迟 require 本模块，避免循环依赖）。
-const milkTeaActivity = require('./milk-tea-activity');
+// 退役奶茶的旧声明与材料预留由兼容模块保留；通用发现不再加载其专属玩法。
 // 历史活动写方法只保留解析结构上下文；即使以后被误接线，也必须在发包前失败。
 const RETIRED_ACTIVITY_WRITES_DISABLED = true;
 
@@ -298,6 +299,138 @@ async function listActivityGroups() {
   return types.ActivityListReply.decode(body);
 }
 
+const SWEET_POTATO_ROOT_ID = 2026111707;
+const SWEET_POTATO_MAIN_ID = 2026111708;
+const SWEET_POTATO_START = 1795572000;
+const SWEET_POTATO_END = 1796831999;
+const SWEET_POTATO_STATE_FIELD = 130;
+const sweetPotatoConnections = new WeakMap();
+let sweetPotatoConnectionSequence = 0;
+
+function getSweetPotatoReadScope(socket) {
+  if (socket?.readyState !== 1) return null;
+  if (!sweetPotatoConnections.has(socket)) sweetPotatoConnections.set(socket, ++sweetPotatoConnectionSequence);
+  return sweetPotatoConnections.get(socket);
+}
+
+function invalidateSweetPotatoReadScope(socket) {
+  if (socket) sweetPotatoConnections.delete(socket);
+}
+
+function sweetPotatoUnavailable(reason, status = 'unavailable') {
+  return { available: false, status, reason, startTime: SWEET_POTATO_START, endTime: SWEET_POTATO_END, personal: null };
+}
+
+function sweetPotatoOutsideWindow(now = Date.now()) {
+  if (now < SWEET_POTATO_START * 1000) return sweetPotatoUnavailable('活动尚未开放');
+  if (now >= SWEET_POTATO_END * 1000) return sweetPotatoUnavailable('活动已结束');
+  return null;
+}
+
+function sweetPotatoNumber(value) {
+  const number = Long.isLong(value) ? value.toNumber() : value;
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+function isSweetPotatoNode(node, id, parentId) {
+  const info = node?.activity;
+  return sweetPotatoNumber(info?.id) === id
+    && sweetPotatoNumber(info?.parent_id) === parentId
+    && sweetPotatoNumber(info?.start_time) === SWEET_POTATO_START
+    && sweetPotatoNumber(info?.end_time) === SWEET_POTATO_END
+    && info.visible === true;
+}
+
+function hasValidSweetPotatoFields(bytes, claims = false) {
+  // protobufjs decodes known fields by number alone; check their wire types and
+  // reject overflowing varints or invalid claim flags before projecting state.
+  const reader = protobuf.Reader.create(bytes);
+  const wireTypes = claims ? { 1: 0, 2: 0 } : { 1: 2, 3: 0, 5: 0, 6: 0, 7: 0, 11: 0 };
+  const seen = new Set();
+  try {
+    while (reader.pos < reader.len) {
+      const tag = reader.uint32();
+      const field = tag >>> 3;
+      const wire = tag & 7;
+      const expected = wireTypes[field];
+      if (!field || (expected !== undefined && (expected !== wire || seen.has(field)))) return false;
+      if (expected !== undefined) seen.add(field);
+      if (!claims && field === 1) {
+        if (!hasValidSweetPotatoFields(reader.bytes(), true)) return false;
+        continue;
+      }
+      const start = reader.pos;
+      reader.skipType(wire);
+      if (expected !== 0) continue;
+      const length = reader.pos - start;
+      if (claims && (length !== 1 || reader.buf[start] > 1)) return false;
+      if (length > 10 || (length === 10 && reader.buf[reader.pos - 1] > 1)) return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+function hasValidSweetPotatoWire(rawBody, mainIndex) {
+  const groups = readProtoFields(rawBody).filter(entry => entry.field === 1);
+  if (groups.length !== 1 || groups[0].wire !== 2) return false;
+  const main = getProtoBytesAll(readProtoFields(groups[0].value), 2)[mainIndex];
+  const slots = readProtoFields(main).filter(entry => entry.field === SWEET_POTATO_STATE_FIELD);
+  return slots.length === 1 && slots[0].wire === 2 && hasValidSweetPotatoFields(slots[0].value);
+}
+
+async function getSweetPotatoActivity(isCurrent = () => true) {
+  const outside = sweetPotatoOutsideWindow();
+  if (outside) return outside;
+
+  const listed = await listActivityGroups();
+  const afterList = sweetPotatoOutsideWindow();
+  if (afterList) return afterList;
+  if (!isCurrent()) throw new Error('账号连接已变化，请重新读取');
+  const roots = (listed?.groups || []).filter(node => sweetPotatoNumber(node?.activity?.id) === SWEET_POTATO_ROOT_ID);
+  if (roots.length !== 1 || !isSweetPotatoNode(roots[0], SWEET_POTATO_ROOT_ID, 0)) {
+    return sweetPotatoUnavailable('当前活动列表未下发有效的以薯换福');
+  }
+
+  const reply = await getActivityGroup(SWEET_POTATO_ROOT_ID, '', { discoveryProbe: true });
+  const { group } = reply;
+  const afterGroup = sweetPotatoOutsideWindow();
+  if (afterGroup) return afterGroup;
+  if (!isCurrent()) throw new Error('账号连接已变化，请重新读取');
+  const children = (group?.children || []).filter(node => sweetPotatoNumber(node?.activity?.id) === SWEET_POTATO_MAIN_ID);
+  const main = children[0];
+  if (!isSweetPotatoNode(group, SWEET_POTATO_ROOT_ID, 0) || children.length !== 1
+      || !isSweetPotatoNode(main, SWEET_POTATO_MAIN_ID, SWEET_POTATO_ROOT_ID)
+      || parseActivityPayload(main.activity.payload)?.uid !== 'YiShuHuanFuMainUI') {
+    return sweetPotatoUnavailable('活动详情未下发当前玩法');
+  }
+
+  const state = main.sweet_potato;
+  if (!state || !hasValidSweetPotatoWire(reply.__rawBody, group.children.indexOf(main))) {
+    return sweetPotatoUnavailable('个人活动状态待确认', 'unknown');
+  }
+  const readNumber = field => Object.hasOwn(state, field) ? sweetPotatoNumber(state[field]) : null;
+  const basePrice = readNumber('base_price');
+  if (!(basePrice > 0)) return sweetPotatoUnavailable('个人铺价待确认', 'unknown');
+
+  return {
+    available: true,
+    status: 'available',
+    startTime: SWEET_POTATO_START,
+    endTime: SWEET_POTATO_END,
+    personal: {
+      basePrice,
+      criticalBonus: readNumber('critical_bonus'),
+      receivedCount: readNumber('received_count'),
+      coinBalance: readNumber('coin_balance'),
+      pendingDividend: readNumber('pending_dividend'),
+      seedsClaimed: state.claims ? state.claims.seeds_claimed === true : null,
+      shared: state.claims ? state.claims.shared === true : null,
+    },
+  };
+}
+
 function parseActivityPayload(value) {
   if (value && typeof value === 'object') return value;
   const payloadText = String(value || '').trim();
@@ -482,17 +615,6 @@ async function getActivityGroupSnapshot(activityId, uid = '', options = {}) {
   // 需要二次解码的服务内调用方（萌宠一键领取资格）通过 onRawBody 私有回调就地消费。
   if (typeof options?.onRawBody === 'function') {
     options.onRawBody(reply?.__rawBody ? Buffer.from(reply.__rawBody) : null);
-  }
-  // 奶茶根（S4 2026110100）：专用解码器就地消费原始回包，把 121 店铺摘要 /
-  // 102 商城富解析（限购/费用/条件）/ 122 成长基金合并进子节点 details；
-  // 快乐值 120 由通用 share_reward 解析。解码失败保持通用兜底，不额外探测。
-  if (toNum(activityId) === milkTeaActivity.MILK_TEA_ROOT_ACTIVITY_ID) {
-    try {
-      milkTeaActivity.normalizeMilkTeaDiscovery(
-        snapshot,
-        reply?.__rawBody ? Buffer.from(reply.__rawBody) : null,
-      );
-    } catch { /* 缺少专用字段时按通用兜底展示，不触发重试或探测 */ }
   }
   return {
     ...snapshot,
@@ -2309,6 +2431,7 @@ async function claimQingmeiSeeds() {
   }
   if (claimedCount > 0) markQingmeiClaimedToday();
 
+  require('./automation-observability').logActivityAction('qingmei_seed', claimedCount);
   activityLogger.info('领取青梅种子完成', {
     event: 'qingmei_seed_claim',
     itemId: QINGMEI_SEED_ITEM_ID,
@@ -2412,6 +2535,7 @@ async function brewAndSellQingmeiWine(options = {}) {
   await delay(HELU_DRAW_REFRESH_DELAY_MS);
   const afterMaterialCount = await getBagItemCount(QINGMEI_FRUIT_ITEM_ID);
 
+  require('./automation-observability').logActivityAction('qingmei_wine', sell.gold);
   activityLogger.info('青梅酿售卖完成', {
     event: 'qingmei_wine_sell',
     beforeMaterialCount,
@@ -2623,6 +2747,7 @@ async function claimSeasonPassportRewards() {
   const result = normalizeSeasonClaimResult(await claimSeasonRewardsRaw());
   const after = await getSeasonPassport();
 
+  require('./automation-observability').logActivityAction('season_passport', result.rewards.length);
   activityLogger.info('荷风游记领取成功', {
     event: 'season_passport_claim',
     beforeLevel: before.currentLevel,
@@ -2657,6 +2782,7 @@ async function claimSolarTermsReward(termId = 0) {
   const result = normalizeSolarTermsClaimResult(await claimSolarTermsRaw(resolvedTermId));
   const after = await getSolarTermsInfo();
 
+  require('./automation-observability').logActivityAction('solar_terms', result.rewards.length);
   activityLogger.info('节令小札领取成功', {
     event: 'solar_terms_claim',
     termId: resolvedTermId,
@@ -2922,6 +3048,7 @@ async function claimStarRecordRewards() {
   const rewards = (result?.rewards || []).map(normalizeCoreItem).filter(item => item.itemId > 0);
   const after = await getStarActivity();
 
+  require('./automation-observability').logActivityAction('star_record', rewards.filter(item => Number(item.itemCount) > 0).length);
   activityLogger.info('观星礼录领取成功', {
     event: 'star_record_claim',
     recordIds,
@@ -3437,11 +3564,8 @@ void [
 ];
 
 module.exports = {
-  FRIEND_RECALL_ROOT_ACTIVITY_ID: 2026111800,
-  FRIEND_RECALL_ACTIVITY_ID: 2026111801,
   ...bearActivity,
   ...seasonWishActivities,
-  ...milkTeaActivity,
   getBearActivity,
   getWishActivity,
   getHappyShareActivity,
@@ -3488,6 +3612,10 @@ module.exports = {
   HELU_DRAW_CMD,
   getActivityGroup,
   listActivityGroups,
+  getSweetPotatoActivity,
+  getSweetPotatoReadScope,
+  invalidateSweetPotatoReadScope,
+  sweetPotatoOutsideWindow,
   normalizeCoreItem,
   getActivityDiscoveryList,
   getActivityGroupSnapshot,

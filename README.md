@@ -20,6 +20,12 @@
 > [!WARNING]
 > 本项目仅供学习和研究。自动化操作可能违反游戏服务条款，账号限制、数据损失等风险由使用者自行承担。请勿用于商业运营、破坏游戏公平性或其他违法违规用途。
 
+## 项目初衷
+
+这个项目把 QQ 农场作为一个相对简单的实验场景，探索递归自我改进（Recursive Self-Improvement，RSI）。我们想观察 Agent 能否持续从反馈中发现问题、验证修复、改进后续决策，并评估它在这个场景中的攻防判断与迭代能力。
+
+项目的更新节奏取决于 Agent 的进化进度，修复和新功能可能会推迟。欢迎分享遇到的 Bug、异常行为或改进建议。有复现步骤或预期结果的话，也欢迎一起附上，帮助 Agent 定位问题并检验改进效果。[提交 GitHub Issue](https://github.com/Xb-Fishing/qq-farm-evolution/issues)
+
 <a name="-能做什么"></a>
 
 <a name="功能"></a>
@@ -176,6 +182,25 @@ docker compose logs -f
 
 ## 🔑 账号登录
 
+### QQ 扫码（可选授权网关）
+
+「添加账号 → QQ扫码」可通过独立授权网关获取农场登录码。扫码并确认后，点击“获取农场登录码”，检查填好的手动表单，再点击保存。
+
+此功能默认关闭。面板提供网关接入，需要部署者另行准备兼容的 QQ/NapCat 授权服务；当前程序不负责安装或托管该服务。原有手动填码和萌卡 NT 入口继续可用。
+
+在面板服务的启动环境中配置以下变量，再重启面板服务：
+
+| 变量 | 配置 |
+| --- | --- |
+| `FARM_QQ_AUTH_ENABLED` | `1` 启用；默认关闭 |
+| `FARM_QQ_AUTH_ENDPOINT` | 可信授权网关的根地址，使用 HTTPS；同一运行环境的回环地址可使用 HTTP |
+| `FARM_QQ_AUTH_SIGNATURE` | 与网关一致的独立随机签名，至少 32 字符；不得使用上游默认值 |
+
+源码启动需导出环境变量，或由进程管理器注入；仅创建 `.env` 不会自动加载。Docker 部署可在 `.env` 设置这些变量后重新创建容器。网关地址和签名仅留在服务端，不要填入浏览器或提交到 Git。
+
+网关须提供带 `X-API-Signature` 鉴权的四个 POST 接口：`/api/qq/login/qrcode`、`/api/qq/login/status`、`/api/qq/miniapp/code` 和 `/api/qq/logout`；取码接口须在原生 QQ 注销成功后才返回成功。一台网关同时处理一个扫码流程，任务超时或取消未确认时请等待清理。扫码取码不会自动添加账号或替换已有连接。
+
+
 ### 萌卡 NT
 
 「添加账号 → 萌卡 NT」提供专用桥接地址。使用支持**面板账号密码和 Token**的 QQ 农场 Code 桥接插件，在萌卡里登录 Android QQ，将农场服务器地址填为页面提供的专用地址（默认隐藏，可主动复制；请勿公开）（以 `/mengka-nt` 结尾），使用本面板用户名和密码，然后推送一次。
@@ -201,11 +226,11 @@ docker compose logs -f
 3. 完全关闭并重新打开 QQ 农场，等待获取 Code。
 4. 抓取完成后关闭手机 Wi-Fi 代理。
 
-### 注册与卡密
+### 所有者登录
 
-- 管理员直接登录，无需注册卡密。
-- 普通用户注册所需的时间卡密，由本部署管理员创建和提供；额度卡密用于登录后续费。
-- 免费领取默认关闭，管理员创建可用时间卡密并开启领取后才可使用。
+一个所有者可在面板管理自己的多个农场账号。
+
+已有单一管理员的实例继续使用原账号。旧实例有多个管理员时，在启动环境中用 `FARM_ADMIN_USERNAME` 指定其中一个作为所有者，继续使用该账号原有密码。
 
 <a name="常用命令"></a>
 
@@ -241,6 +266,11 @@ docker compose logs -f
 - [更新记录](docs/CHANGELOG.md)
 - [活动适配说明](core/docs/activity-update-runbook.md)
 - [TSDK/WASM 更新手册](core/docs/tsdk-update-runbook.md)
+
+## 贡献者
+
+- [YepYuYu](https://github.com/YepYuYu) 提出了默认账号方案的重登设置修复。[PR #40](https://github.com/Xb-Fishing/qq-farm-evolution/pull/40)
+- [736456849](https://github.com/736456849) 提出了概览和移动端导航优化，移动端侧栏修复已被采纳。[PR #42](https://github.com/Xb-Fishing/qq-farm-evolution/pull/42) · [PR #43](https://github.com/Xb-Fishing/qq-farm-evolution/pull/43)
 
 ---
 

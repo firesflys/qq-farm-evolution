@@ -12,6 +12,7 @@ const props = defineProps<{
   watchlistGidSet: Set<number>
   autoBadGidSet: Set<number>
   knownFriendGidSet: Set<number>
+  deleteDisabled: boolean
   expandedFriends: Set<string>
   friendLands: Record<string, any[]>
   friendLandsLoading: Record<string, boolean>
@@ -31,6 +32,7 @@ const emit = defineEmits<{
   (e: 'toggleBlacklist', friend: any, event: Event): void
   (e: 'toggleWatchlist', friend: any, event: Event): void
   (e: 'toggleAutoBad', friend: any, event: Event): void
+  (e: 'deleteFriend', friend: any): void
   (e: 'removeKnownFriendGid', friend: any, event: Event): void
   (e: 'friendAvatarError', friend: any): void
 }>()
@@ -47,20 +49,25 @@ function formatActiveAgo(atMs: number) {
     return `${minutes}分钟前`
   return `${Math.floor(minutes / 60)}小时前`
 }
+
+function formatLastLogin(at: unknown) {
+  if (typeof at !== 'number' || !Number.isSafeInteger(at) || at <= 0 || at > Date.now())
+    return '暂无登录时间'
+  return new Date(at).toLocaleString('zh-CN', { hour12: false })
+}
 </script>
 
 <template>
   <div
     v-for="friend in friends"
     :key="friend.gid"
-    class="overflow-hidden rounded-lg bg-white shadow dark:bg-gray-800"
+    class="friend-card overflow-hidden rounded-lg bg-white shadow dark:bg-gray-800"
   >
     <div
-      class="flex flex-col cursor-pointer justify-between gap-4 p-4 transition sm:flex-row sm:items-center hover:bg-gray-50 dark:hover:bg-gray-700/50"
-      :class="blacklistGidSet.has(Number(friend.gid)) ? 'opacity-50' : ''"
+      class="friend-card-layout grid cursor-pointer gap-3 p-3 transition sm:p-4 hover:bg-gray-50 dark:hover:bg-gray-700/50"
       @click="emit('toggleFriend', friend.gid)"
     >
-      <div class="flex items-center gap-3">
+      <div class="min-w-0 flex items-start gap-3">
         <div class="h-10 w-10 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 ring-1 ring-gray-100 dark:bg-gray-600 dark:ring-gray-700">
           <img
             v-if="canShowFriendAvatar(friend)"
@@ -71,10 +78,12 @@ function formatActiveAgo(atMs: number) {
           >
           <div v-else class="i-carbon-user text-gray-400" />
         </div>
-        <div>
-          <div class="flex items-center gap-2 font-bold">
-            {{ friend.name }} ({{ friend.gid }})
-
+        <div class="min-w-0 [overflow-wrap:anywhere]">
+          <div class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <span class="min-w-0 font-bold">{{ friend.name }}</span>
+            <span class="text-xs text-gray-600 dark:text-gray-300">({{ friend.gid }})</span>
+          </div>
+          <div class="friend-card-badges mt-1 flex flex-wrap items-center gap-1.5 empty:hidden">
             <span v-if="blacklistGidSet.has(Number(friend.gid))" class="rounded bg-gray-200 px-1.5 py-0.5 text-xs text-gray-500 dark:bg-gray-700 dark:text-gray-400">已屏蔽</span>
             <span v-if="friend.online" class="inline-flex items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 text-xs text-green-600 dark:bg-green-900/30 dark:text-green-400">
               <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-green-500" />
@@ -105,10 +114,13 @@ function formatActiveAgo(atMs: number) {
               金币 {{ formatFriendGold(friend.gold) }}
             </span>
             <span
-              v-if="friend.dogName"
+              v-if="friend.dogName && (friend.dogName !== '护主犬' || Number(friend.dogId) !== 90021)"
               class="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500 dark:bg-gray-700 dark:text-gray-300"
             >
               {{ friend.dogName }}
+            </span>
+            <span :title="friend.lastLoginAt == null ? '当前游戏名单未提供可用的最近登录时间' : undefined">
+              最近登录 <span>{{ formatLastLogin(friend.lastLoginAt) }}</span>
             </span>
           </div>
           <div class="text-sm" :class="getFriendStatusText(friend) !== '无操作' ? 'text-green-500 font-medium' : 'text-gray-400'">
@@ -120,7 +132,7 @@ function formatActiveAgo(atMs: number) {
         </div>
       </div>
 
-      <div class="flex flex-wrap gap-2">
+      <div class="friend-card-actions min-w-0 flex flex-wrap gap-2">
         <button
           class="rounded bg-blue-100 px-3 py-2 text-sm text-blue-700 transition hover:bg-blue-200"
           @click="emit('operate', friend.gid, 'steal', $event)"
@@ -188,6 +200,14 @@ function formatActiveAgo(atMs: number) {
           @click="emit('removeKnownFriendGid', friend, $event)"
         >
           移出同步列表
+        </button>
+        <button
+          type="button"
+          class="rounded border border-red-200 px-3 py-2 text-sm text-red-700 transition focus-visible:outline-red-600 disabled:cursor-not-allowed disabled:opacity-60 hover:bg-red-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-900/30"
+          :disabled="deleteDisabled"
+          @click.stop="emit('deleteFriend', friend)"
+        >
+          删除好友
         </button>
       </div>
     </div>
@@ -263,3 +283,38 @@ function formatActiveAgo(atMs: number) {
     </span>
   </div>
 </template>
+
+<style scoped>
+.friend-card {
+  container: friend-card / inline-size;
+}
+
+.friend-card-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.friend-card-badges > span {
+  white-space: nowrap;
+}
+
+.friend-card-actions > button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  min-height: 2.75rem;
+  white-space: nowrap;
+}
+
+@container friend-card (min-width: 50rem) {
+  .friend-card-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+    align-items: center;
+  }
+
+  .friend-card-actions {
+    justify-content: flex-end;
+  }
+}
+</style>

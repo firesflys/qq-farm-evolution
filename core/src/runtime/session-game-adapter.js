@@ -9,7 +9,7 @@ const STATS_METHODS = new Set(['recordOperation', 'recordTongQiGift', 'getTongQi
   'initStats', 'initStatsWithPersistence', 'updateStats', 'setInitialValues', 'recordGoldExp', 'resetSessionGains',
   'getStats', 'saveStats', 'getTodayKey', 'loadPersistedStats', 'checkAndResetDailyStats']);
 const GOVERNOR_METHODS = new Set(['getRequestProfile', 'getBreakerState', 'clearBreaker', 'setWatchMode',
-  'setContentionMode', 'setUrgentMode', 'urgentModeActive']);
+  'setContentionMode', 'setUrgentMode', 'urgentModeActive', 'setRosterSize']);
 const STATUS_METHODS = new Set(['setStatusPlatform', 'updateStatus', 'updateStatusFromLogin', 'updateStatusGold', 'updateStatusLevel']);
 const NETWORK_READ_METHODS = new Set(['getWsErrorState', 'getAceStatus', 'getRequestProfile', 'getBreakerState',
   'buildLoginDeviceInfo', 'buildWebSocketHeaders', 'extractServerClientVersion']);
@@ -73,6 +73,7 @@ async function createSessionGameAdapter({ account, onRevoked = () => {}, onMaste
     const socket = network.getWs();
     if (socket && socket !== lastSocket) { lastSocket = socket; connectionEpoch++; }
     return { connectionEpoch, loginEpoch, configRevision, loginReadyAt, firstLoginReadyAt, loginCredentialGeneration,
+      requestPolicy: { supported: true, ...governor.getRequestProfile().policy },
       clientVersion: CONFIG.clientVersion, platform: CONFIG.platform,
       sessionGeneration: account.sessionGeneration, connected: loginReady && network.isConnected(),
       terminal: stopped || terminationPending,
@@ -91,6 +92,7 @@ async function createSessionGameAdapter({ account, onRevoked = () => {}, onMaste
     if (identity !== policyIdentity) { policyIdentity = identity; configRevision++; }
     const patch = { ...config }; delete patch.knownFriendGids; delete patch.__clientRuntime;
     store.applyConfigSnapshot(patch, { persist: false, accountId: account.id });
+    governor.configurePolicy(store.getConfigSnapshot(account.id).requestPolicy);
     if (clientRuntime?.apply) updateRuntimeConfig({ clientVersion: clientRuntime.clientVersion });
     if (clientRuntime) Object.assign(clientRuntimeState, clientRuntime.nextState);
     if (store.getFriendQuietHours(account.id).idleProtectionEnabled !== true) idle.setIdleProtectionUntil(0);

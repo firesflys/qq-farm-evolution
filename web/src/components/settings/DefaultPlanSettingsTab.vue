@@ -6,6 +6,7 @@ import AutomationSettingsTab from '@/components/settings/AutomationSettingsTab.v
 import StrategySettingsTab from '@/components/settings/StrategySettingsTab.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseSwitch from '@/components/ui/BaseSwitch.vue'
+import { defaultRequestPolicy } from '@/utils/request-policy'
 
 interface BagSeedItem {
   seedId: number
@@ -49,6 +50,7 @@ onBeforeUnmount(() => {
 
 const strategySettings = ref(createStrategySettings())
 const automationSettings = ref(createAutomationSettings())
+const includeKickoutRelogin = ref(false)
 const autoCodeRefresh = ref({ enabled: false, intervalMinutes: 60 })
 
 function createStrategySettings() {
@@ -62,6 +64,7 @@ function createStrategySettings() {
     plantOrderRandom: true,
     plantDelaySeconds: 2,
     intervals: { farmMin: 8, farmMax: 12, helpMin: 30, helpMax: 35, stealMin: 25, stealMax: 30 },
+    requestPolicy: defaultRequestPolicy(),
     friendQuietHours: { enabled: false, start: '23:00', end: '07:00', minSleepMinutes: 1, maxSleepMinutes: 120, wakeBeforeMinutes: 66, watchlistWakeBeforeMinutes: 122, pauseUntil: '', idleProtectionEnabled: false },
   }
 }
@@ -73,6 +76,7 @@ function createAutomationSettings() {
       harvest: false,
       plant: false,
       task: false,
+  dog_auto_feed: false,
       milk_tea_auto_rewards: false,
       milk_tea_auto_seeds: false,
       milk_tea_auto_work: false,
@@ -127,13 +131,15 @@ function createAutomationSettings() {
 }
 
 function applyPlan(data: any) {
-  const config = data?.config || {}
+  const { kickoutRelogin, ...config } = data?.config || {}
   exists.value = data?.exists === true
+  includeKickoutRelogin.value = exists.value && !!kickoutRelogin
   enabled.value = data?.enabled !== false
   updatedAt.value = Number(data?.updatedAt) || 0
   strategySettings.value = {
     ...createStrategySettings(),
     ...config,
+    requestPolicy: { ...createStrategySettings().requestPolicy, ...(config.requestPolicy || {}) },
     intervals: { ...createStrategySettings().intervals, ...(config.intervals || {}) },
     friendQuietHours: { ...createStrategySettings().friendQuietHours, ...(config.friendQuietHours || {}) },
     bagSeedPriority: Array.isArray(config.bagSeedPriority) ? [...config.bagSeedPriority] : [],
@@ -143,6 +149,7 @@ function applyPlan(data: any) {
     ...automationDefaults,
     ...config,
     automation: { ...automationDefaults.automation, ...(config.automation || {}) },
+    kickoutRelogin: { ...automationDefaults.kickoutRelogin, ...kickoutRelogin },
   }
   autoCodeRefresh.value = {
     enabled: config.autoCodeRefresh?.enabled === true,
@@ -191,7 +198,9 @@ function buildConfig() {
   return {
     ...strategySettings.value,
     // Both drafts contain the loaded config; only automation fields may override current strategy edits.
-    ...Object.fromEntries(automationKeys.map(key => [key, automationSettings.value[key]])),
+    ...Object.fromEntries(automationKeys
+      .filter(key => key !== 'kickoutRelogin' || includeKickoutRelogin.value)
+      .map(key => [key, automationSettings.value[key]])),
     autoCodeRefresh: autoCodeRefresh.value,
   }
 }
@@ -220,13 +229,6 @@ async function savePlan() {
     return
   saving.value = true
   try {
-    const policy = automationSettings.value.automation.milk_tea_seed_policy
-    const hirePolicy = automationSettings.value.automation.milk_tea_hire_policy
-    if (automationSettings.value.automation.milk_tea_auto_hire && (![1, 2, 3].includes(hirePolicy.durationId)
-      || [hirePolicy.ticketDailyLimit, hirePolicy.ticketReserve].some(value => !/^(?:0|[1-9]\d{0,19})$/.test(String(value)))))
-      throw new Error('请修正奶茶雇佣班次与预算后保存')
-    if (automationSettings.value.automation.milk_tea_auto_seeds && (!Number.isSafeInteger(policy.targetStock) || policy.targetStock < 0 || policy.targetStock > 9999 || [policy.coinReserve, policy.coinDailyLimit, policy.ticketReserve, policy.ticketDailyLimit].some(value => !/^(?:0|[1-9]\d{0,19})$/.test(String(value)))))
-      throw new Error('请修正奶茶购种库存目标与预算后保存')
     const { data } = await api.put('/api/settings/default-plan', {
       enabled: enabled.value,
       config: buildConfig(),
@@ -422,6 +424,7 @@ onMounted(fetchPlan)
     <AutomationSettingsTab
       v-else
       v-model:settings="automationSettings"
+      v-model:include-kickout-relogin="includeKickoutRelogin"
       v-model:auto-code-refresh="autoCodeRefresh"
       current-account-id="default-plan"
       :current-account-name="null"

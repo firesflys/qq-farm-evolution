@@ -69,17 +69,20 @@ function completeConfig(quietEnabled = false) {
   };
 }
 
-async function mountPage(t, config = completeConfig(), historical = false) {
+async function mountPage(t, config = completeConfig(), { historical = false, planUser } = {}) {
   const calls = [];
   const notifications = [];
-  let stored = { exists: true, enabled: true, updatedAt: 1, config: clone(config) };
+  const store = planUser ? require('../src/models/store') : null;
+  let stored = store
+    ? store.setUserDefaultAccountPlan(planUser, config)
+    : { exists: true, enabled: true, updatedAt: 1, config: clone(config) };
   const api = {
     failure: null,
     async get(url) {
       if (url === '/api/activity/milk-tea/seed-catalog') return { data: { ok: true, seeds: [{id:20525,name:'森野甜莓种子'},{id:21435,name:'森野柿子种子'}] } };
       assert.equal(url, endpoint, 'no production or unrelated API calls');
       calls.push({ method: 'get', url });
-      return { data: { ok: true, data: clone(stored) } };
+      return { data: { ok: true, data: store ? store.getUserDefaultAccountPlan(planUser) : clone(stored) } };
     },
     async put(url, body) {
       assert.equal(url, endpoint, 'no production or unrelated API calls');
@@ -87,13 +90,16 @@ async function mountPage(t, config = completeConfig(), historical = false) {
       if (api.failure === 'throw') throw new Error('synthetic transport failure');
       if (api.failure === 'response')
         return { data: { ok: false, error: 'synthetic rejected save', data: clone(stored) } };
-      stored = { exists: true, enabled: body.enabled, updatedAt: stored.updatedAt + 1, config: clone(body.config) };
+      stored = store
+        ? store.setUserDefaultAccountPlan(planUser, body.config, { enabled: body.enabled })
+        : { exists: true, enabled: body.enabled, updatedAt: stored.updatedAt + 1, config: clone(body.config) };
       return { data: { ok: true, data: clone(stored) } };
     },
   };
   const Page = compileSfcModule(path.join(WEB, 'src/components/settings/DefaultPlanSettingsTab.vue'), spec => {
     if (historical && /AutomationSettingsTab\.vue$/.test(spec)) return { __esModule: true, default: loadHistoricalAutomation(child => child === '@/api' ? { __esModule: true, default: api } : child === 'vue' ? vue : undefined) };
-    if (spec === 'vue') return vue;
+    // Only browser CSS transition hooks are replaced; real modal template and handlers remain.
+    if (spec === 'vue') return { ...vue, Transition: (_props, { slots }) => slots.default?.() };
     if (spec === '@/api') return { __esModule: true, default: api };
     return undefined;
   });
@@ -151,7 +157,7 @@ async function setSwitch(page, label, value) {
 test('dedicated milk rewards switch saves and remounts without enabling ordinary tasks', async t => {
   const config = completeConfig();
   config.automation.milk_tea_auto_rewards = false;
-  const page = await mountPage(t, config, true);
+  const page = await mountPage(t, config, { historical: true });
   click(button(page.root, '自动控制')); await vue.nextTick();
   await setSwitch(page, '奶茶自动领奖（满额收银、快乐值）', true);
   const saved = await save(page);
@@ -182,6 +188,29 @@ async function section(page, name) {
   click(button(page.root, name));
   await vue.nextTick();
 }
+
+test('the default plan saves a reconnect delay only while opted in', async t => {
+  const config = completeConfig();
+  delete config.kickoutRelogin;
+  const page = await mountPage(t, config, { planUser: 'synthetic-relogin-plan' });
+  const label = '将重登延迟纳入默认方案';
+  assert.equal(Object.hasOwn(await save(page), 'kickoutRelogin'), false);
+  await section(page, '自动控制');
+  assert.equal(input(page.root, label).checked, false);
+  assert.doesNotMatch(textOf(page.root), /重登延迟 \(分钟\)/);
+  await setSwitch(page, label, true);
+  await setInput(page, '重登延迟 (分钟)', 17);
+  assert.deepEqual((await save(page)).kickoutRelogin, { delayMinutes: 17, validUntil: '' });
+  await page.reload();
+  await section(page, '自动控制');
+  assert.equal(input(page.root, label).checked, true);
+  assert.equal(input(page.root, '重登延迟 (分钟)').props.value, 17);
+  await setSwitch(page, label, false);
+  assert.equal(Object.hasOwn(await save(page), 'kickoutRelogin'), false);
+  await page.reload();
+  await section(page, '自动控制');
+  assert.equal(input(page.root, label).checked, false);
+});
 
 for (const initial of [false, true]) {
   test(`real quiet switch ${initial} -> ${!initial} survives payload, response, repeated save and reload`, async (t) => {
@@ -291,7 +320,7 @@ for (const failure of ['response', 'throw']) {
 }
 
 test('milk seed/work/upgrade preferences and exact budgets survive real default-plan save and remount', async t => {
-  const page = await mountPage(t, completeConfig(), true); await section(page, '自动控制');
+  const page = await mountPage(t, completeConfig(), { historical: true }); await section(page, '自动控制');
   for (const label of ['自动购买活动种子', '自动班次工作（互动与工资）', '自动升级店铺', '森野甜莓种子']) await setSwitch(page, label, true);
   click(button(page.root, '展开高级预算')); await vue.nextTick();
   await setInput(page, '奶茶券每日上限', '0');
@@ -303,11 +332,11 @@ test('milk seed/work/upgrade preferences and exact budgets survive real default-
   page.api.failure = 'response'; await save(page); assert.ok(page.notifications.some(row => row[1] === 'danger'));
 });
 
-test('full milk preset and separate hire budget survive default-plan reload and invalid hire policy makes zero PUT', async t => {
+test('historical full milk preset and separate hire budget survive default-plan reload', async t => {
   const config = completeConfig();
   config.automation.milk_tea_seed_policy = { targetSeedIds: [21435], targetStock: 24, coinReserve: '1000000', coinDailyLimit: '180000', ticketReserve: '8000', ticketDailyLimit: '0' };
   config.automation.milk_tea_hire_policy = { durationId: 1, ticketDailyLimit: '80', ticketReserve: '9000' };
-  const page = await mountPage(t, config, true); await section(page, '自动控制');
+  const page = await mountPage(t, config, { historical: true }); await section(page, '自动控制');
   click(button(page.root, '推荐全自动（保留目标与额度）')); await vue.nextTick();
   const saved = await save(page);
   assert.equal(saved.automation.milk_tea_auto_craft, true); assert.equal(saved.automation.milk_tea_auto_hire, true);
@@ -315,10 +344,42 @@ test('full milk preset and separate hire budget survive default-plan reload and 
   assert.equal(saved.automation.milk_tea_hire_policy.ticketDailyLimit, '80'); assert.equal(saved.automation.milk_tea_seed_policy.ticketDailyLimit, '0');
   assert.deepEqual(saved.automation.milk_tea_seed_policy.targetSeedIds, [21435]);
   await page.reload(); await section(page, '自动控制'); assert.equal(input(page.root, '自动雇佣员工').checked, true);
-  click(button(page.root, '展开高级预算')); await vue.nextTick(); await setInput(page, '雇佣每日上限（奶茶券）', '-1');
-  const before = page.calls.filter(row => row.method === 'put').length;
+});
+
+test('current default plan saves and reloads ordinary edits with normalized disabled legacy policies', async t => {
+  const store = require('../src/models/store');
+  const planUser = 'synthetic-legacy-plan';
+  const otherUser = 'synthetic-other-plan';
+  const otherPlan = store.setUserDefaultAccountPlan(otherUser, completeConfig(true));
+  const config = completeConfig();
+  config.automation.milk_tea_auto_hire = true;
+  config.automation.milk_tea_hire_policy = { durationId: 1, ticketDailyLimit: '-1', ticketReserve: '9000' };
+  config.automation.milk_tea_auto_seeds = true;
+  config.automation.milk_tea_seed_policy = { targetSeedIds: [20525], targetStock: 24, coinDailyLimit: '-1' };
+  const page = await mountPage(t, config, { planUser });
+  const initial = store.getUserDefaultAccountPlan(planUser).config.automation;
+  const legacy = Object.fromEntries(Object.entries(initial).filter(([key]) => key.startsWith('milk_tea_')));
+  assert.equal(legacy.milk_tea_auto_hire, true);
+  assert.deepEqual(legacy.milk_tea_hire_policy, { durationId: 0, ticketDailyLimit: '0', ticketReserve: '8000' });
+  assert.equal(legacy.milk_tea_auto_seeds, true);
+  await section(page, '自动控制');
+  assert.doesNotMatch(textOf(page.root), /自动雇佣员工|自动购买活动种子/);
+  await setSwitch(page, '自动做任务', true);
   click(button(page.root, '保存默认方案')); await flush();
-  assert.equal(page.calls.filter(row => row.method === 'put').length, before); assert.match(page.notifications.at(-1)[0], /雇佣/);
+  assert.deepEqual(page.calls.map(({ method }) => method), ['get', 'put']);
+  const sent = page.calls[1].body.config.automation;
+  const persisted = store.getUserDefaultAccountPlan(planUser).config.automation;
+  assert.equal(sent.task, true);
+  for (const [key, value] of Object.entries(legacy)) {
+    assert.deepEqual(sent[key], value, key);
+    assert.deepEqual(persisted[key], value, key);
+  }
+  assert.deepEqual(page.notifications, [['默认方案已保存']]);
+  await page.reload();
+  await section(page, '自动控制');
+  assert.equal(input(page.root, '自动做任务').checked, true);
+  assert.deepEqual(page.calls.map(({ method }) => method), ['get', 'put', 'get']);
+  assert.deepEqual(store.getUserDefaultAccountPlan(otherUser), otherPlan);
 });
 
 test('shared timing panel drops dead steal interval inputs and renders maturity scheduling note', async (t) => {
@@ -411,3 +472,51 @@ function loadHistoricalAutomation(resolve) {
   fs.writeFileSync(target, source);
   return compileSfcModule(target, resolve);
 }
+
+test('request thresholds survive mixed draft save and fresh mount; disabling requires explicit risk confirmation', async t => {
+  const page = await mountPage(t, completeConfig());
+  assert.equal(input(page.root, '每 100 位好友新增请求').props.value, 20);
+  await setInput(page, '基础总请求 / 60 秒', 123);
+  await setInput(page, '每 100 位好友新增请求', 60);
+  await setInput(page, '好友请求 / 60 秒', 41);
+  await setInput(page, '单接口 / 60 秒', 37);
+  click(button(page.root, '完全解除本地限速')); await flush();
+  assert.match(textOf(page.root), /不可量化.*风险/);
+  assert.equal(page.calls.filter(call => call.method === 'put').length, 0, 'opening confirmation cannot save');
+  click(button(page.root, '取消')); await flush();
+  assert.equal((await save(page)).requestPolicy.enabled, true);
+  click(button(page.root, '完全解除本地限速')); await flush();
+  click(button(page.root, '确认解除')); await flush();
+  await section(page, '自动控制');
+  await setSwitch(page, '自动做任务', true);
+  const saved = await save(page);
+  assert.deepEqual(saved.requestPolicy, { enabled: false, total60s: 123, friend60s: 41, method60s: 37, rosterBonusPer100: 60 });
+  assert.equal(saved.automation.task, true);
+  await page.reload();
+  assert.match(textOf(page.root), /设置：本地限流关闭/);
+  assert.equal(input(page.root, '好友请求 / 60 秒').props.value, 41);
+  assert.equal(input(page.root, '每 100 位好友新增请求').props.value, 60);
+  await setInput(page, '每 100 位好友新增请求', 0);
+  click(button(page.root, '恢复本地限流')); await flush();
+  const enabledPolicy = (await save(page)).requestPolicy;
+  assert.equal(enabledPolicy.enabled, true);
+  assert.equal(enabledPolicy.rosterBonusPer100, 0);
+});
+
+
+test('account switch removes the risk dialog and an old confirmation cannot disable the new account draft', async t => {
+  const Component = compileSfcModule(path.join(WEB, 'src/components/settings/StrategySettingsTab.vue'), spec => spec === 'vue'
+    ? { ...vue, Transition: (_props, { slots }) => slots.default?.() } : undefined);
+  const account = vue.ref('synthetic-A');
+  const draft = vue.ref({ ...completeConfig(), requestPolicy: { enabled: true, total60s: 80, friend60s: 80, method60s: 30 } });
+  const Wrapper = { setup: () => () => vue.h(Component, { currentAccountId: account.value, currentAccountName: account.value,
+    settings: draft.value, 'onUpdate:settings': value => { draft.value = value; }, loading: false, saving: false,
+    plantingStrategyOptions: [], preferredSeedOptions: [], bagFallbackStrategyOptions: [], strategyPreviewLabel: null,
+    bagSeeds: [], sortedBagSeeds: [], unplannedBagSeeds: [], bagSeedsLoading: false, bagSeedsError: null }) };
+  const root = makeNode('root'); t.after(() => render(null, root)); render(vue.h(Wrapper), root);
+  click(button(root, '完全解除本地限速')); await flush(); const oldConfirm = button(root, '确认解除');
+  account.value = 'synthetic-B'; draft.value = { ...completeConfig(), requestPolicy: { enabled: true, total60s: 70, friend60s: 60, method60s: 30 } };
+  await flush(); assert.doesNotMatch(textOf(root), /不可量化地提高/);
+  click(oldConfirm); await flush();
+  assert.equal(draft.value.requestPolicy.enabled, true); assert.equal(draft.value.requestPolicy.total60s, 70);
+});

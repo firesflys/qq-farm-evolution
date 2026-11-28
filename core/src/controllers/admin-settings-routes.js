@@ -83,6 +83,7 @@ function buildSettingsPayload(store, accountId, currentUser) {
   };
 
   return {
+    requestPolicy: accountConfig.requestPolicy,
     intervals: accountId ? store.getIntervals(accountId) : {},
     plantingStrategy: accountId ? store.getPlantingStrategy(accountId) : null,
     preferredSeedId: accountId ? store.getPreferredSeed(accountId) : null,
@@ -192,7 +193,7 @@ function registerAdminSettingsRoutes({
       );
       res.json({ ok: true, data });
     } catch (error) {
-      res.status(500).json({ ok: false, error: error.message });
+      res.status(error.code === 'REQUEST_POLICY_INVALID' ? 400 : 500).json({ ok: false, error: error.message });
     }
   });
 
@@ -250,9 +251,11 @@ function registerAdminSettingsRoutes({
         return res.status(401).json({ ok: false, error: "未登录" });
       }
       const currentPlan = store.getUserDefaultAccountPlan(currentUser.username);
+      const config = store.getDefaultAccountConfig();
+      delete config.kickoutRelogin;
       const data = store.setUserDefaultAccountPlan(
         currentUser.username,
-        store.getDefaultAccountConfig(),
+        config,
         { enabled: currentPlan.enabled !== false },
       );
       res.json({ ok: true, data });
@@ -272,7 +275,7 @@ function registerAdminSettingsRoutes({
       const data = await provider.saveSettings(accountId, req.body || {});
       res.json({ ok: true, data: data || {} });
     } catch (error) {
-      res.status(500).json({ ok: false, error: error.message });
+      res.status(error.code === 'REQUEST_POLICY_INVALID' ? 400 : 500).json({ ok: false, error: error.message });
     }
   });
 

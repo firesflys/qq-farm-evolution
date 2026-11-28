@@ -16,6 +16,10 @@ import { useToastStore } from '@/stores/toast'
 import { formatGoldAmount } from '@/utils/number-format'
 
 const GID_BATCH_SEPARATOR_RE = /[,，\s]+/
+const DAY_MS = 86_400_000
+const ACTIVE_EVIDENCE_MS = 30 * 60_000
+const MAX_INACTIVE_DAYS = 3650
+type LoginFilter = 'all' | 'inactive' | 'unknown'
 
 const accountStore = useAccountStore()
 const friendStore = useFriendStore()
@@ -26,6 +30,7 @@ const {
   friends,
   loading,
   dogInfoLoading,
+  deletingFriendAccounts,
   friendLands,
   friendLandsLoading,
   blacklist,
@@ -55,6 +60,7 @@ const showConfirm = ref(false)
 const confirmMessage = ref('')
 const confirmLoading = ref(false)
 const pendingAction = ref<(() => Promise<any>) | null>(null)
+const friendToDelete = ref<{ accountId: string, gid: number, name: string } | null>(null)
 const avatarErrorKeys = ref<Set<string>>(new Set())
 const searchKeyword = ref('')
 const localKnownFriendGidSyncCooldownSec = ref(300)
@@ -71,6 +77,20 @@ const interactFilters = [
   { key: 'bad', label: '捣乱' },
 ]
 const dogFilter = ref<'all' | 'noGuardDog' | 'guardDog'>('all')
+const loginFilter = ref<LoginFilter>('all')
+const inactiveDays = ref<number | string>(10)
+const filterNow = ref(Date.now())
+const validInactiveDays = computed(() => typeof inactiveDays.value === 'number'
+  && Number.isInteger(inactiveDays.value) && inactiveDays.value >= 1 && inactiveDays.value <= MAX_INACTIVE_DAYS)
+
+function setLoginFilter(event: Event) {
+  loginFilter.value = (event.target as HTMLSelectElement).value as LoginFilter
+}
+
+function setInactiveDays(event: Event) {
+  const input = event.target as HTMLInputElement
+  inactiveDays.value = Number.isNaN(input.valueAsNumber) ? '' : input.valueAsNumber
+}
 const dogFilters = [
   { key: 'all', label: '全部' },
   { key: 'noGuardDog', label: '无护主犬' },
@@ -172,6 +192,8 @@ const showInitialLoading = computed(() =>
 const currentAccountDisconnected = computed(() =>
   currentStatusReady.value && !status.value?.connection?.connected,
 )
+const deletingFriend = computed(() => deletingFriendAccounts.value.has(String(currentAccountId.value || '')))
+const friendDeletionDisabled = computed(() => deletingFriend.value || !currentAccount.value?.running || currentAccountDisconnected.value)
 
 async function handleRemoveGidFromList(gid: number) {
   if (!currentAccountId.value)
@@ -245,9 +267,28 @@ const dogFilteredFriends = computed(() => {
   return sortedFriends.value
 })
 
+function hasLastLoginTime(value: unknown, now: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= now
+}
+
+const noLoginTimeData = computed(() => friends.value.length > 0
+  && !friends.value.some(friend => hasLastLoginTime(friend.lastLoginAt, filterNow.value)))
+const showLoginTimeHint = computed(() => loginFilter.value === 'unknown'
+  || (loginFilter.value === 'inactive' && noLoginTimeData.value))
+
 const filteredFriends = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
-  const list = dogFilteredFriends.value
+  const now = filterNow.value
+  const list = loginFilter.value === 'all' ? dogFilteredFriends.value : dogFilteredFriends.value.filter((friend: any) => {
+    const at = friend.lastLoginAt
+    const known = hasLastLoginTime(at, now)
+    if (loginFilter.value === 'unknown')
+      return !known
+    const isActive = Number.isFinite(friend.activeAt) && friend.activeAt >= now - ACTIVE_EVIDENCE_MS
+      && friend.activeAt <= now
+    return validInactiveDays.value && known && !friend.online && !isActive
+      && now - at > Number(inactiveDays.value) * DAY_MS
+  })
   if (!keyword)
     return list
 
@@ -268,12 +309,13 @@ const paginatedFriends = computed(() => {
   return filteredFriends.value.slice(start, end)
 })
 
-watch(searchKeyword, () => {
+watch([searchKeyword, dogFilter, loginFilter, inactiveDays], () => {
   currentPage.value = 1
+  filterNow.value = Date.now()
 })
 
-watch(dogFilter, () => {
-  currentPage.value = 1
+watch(totalPages, (pages) => {
+  currentPage.value = Math.min(currentPage.value, pages)
 })
 
 const filteredInteractRecords = computed(() => {
@@ -319,6 +361,7 @@ async function loadData() {
 }
 
 useIntervalFn(() => {
+  filterNow.value = Date.now()
   // 10 秒过期的实时在线证据在这里撤销在线标记，回落到 30 秒快照兜底
   friendStore.expireOnlineEvidence()
   friends.value = friends.value.map((friend: any) => {
@@ -384,13 +427,16 @@ useIntervalFn(() => {
 }, 30_000)
 
 watch(currentAccountId, (newId, oldId) => {
+  friendToDelete.value = null
   expandedFriends.value.clear()
+  currentPage.value = 1
+  filterNow.value = Date.now()
   if (oldId !== undefined && newId !== oldId) {
     friendStore.clearFriendData()
     statusStore.clearAccountScopedData()
   }
   loadData()
-}, { immediate: true })
+}, { immediate: true, flush: 'sync' })
 
 watch(() => [currentAccount.value?.id, currentAccount.value?.running] as const, ([id, running], [oldId, oldRunning]) => {
   if (!id)
@@ -402,6 +448,47 @@ watch(() => [currentAccount.value?.id, currentAccount.value?.running] as const, 
   if (id !== oldId || running !== oldRunning)
     loadData()
 })
+
+function requestFriendDeletion(friend: { gid: unknown, name?: string }) {
+  const accountId = currentAccountId.value
+  const gid = Number(friend.gid)
+  if (!accountId || friendDeletionDisabled.value || !Number.isSafeInteger(gid) || gid <= 0)
+    return
+  friendToDelete.value = { accountId, gid, name: friend.name?.trim() || `GID ${gid}` }
+}
+
+function closeFriendDeletion() {
+  if (!deletingFriend.value)
+    friendToDelete.value = null
+}
+
+async function confirmFriendDeletion() {
+  const target = friendToDelete.value
+  if (!target || target.accountId !== currentAccountId.value || deletingFriend.value)
+    return
+  if (friendDeletionDisabled.value) {
+    toast.error('请先连接当前农场账号')
+    friendToDelete.value = null
+    return
+  }
+
+  try {
+    if (await friendStore.deleteFriend(target.accountId, target.gid) && friendToDelete.value === target) {
+      expandedFriends.value.delete(String(target.gid))
+      toast.success(`已删除好友 ${target.name}`)
+    }
+  }
+  catch (error: any) {
+    if (friendToDelete.value === target) {
+      const reason = error?.response?.data?.error || (error?.name === 'Error' ? error.message : '')
+      toast.error(reason && reason !== 'API Timeout' ? reason : '删除结果未确认，请刷新好友列表核对')
+    }
+  }
+  finally {
+    if (friendToDelete.value === target)
+      friendToDelete.value = null
+  }
+}
 
 async function handleRefreshFriends() {
   if (!currentAccountId.value)
@@ -867,8 +954,8 @@ async function handleBatchAddKnownFriendGids() {
               :key="item.gid"
               class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-gray-50 px-3 py-2 dark:bg-gray-700/50"
             >
-              <div class="flex flex-wrap items-center gap-2">
-                <span class="text-sm font-medium text-gray-800 dark:text-gray-200">
+              <div class="min-w-0 flex flex-wrap items-center gap-2">
+                <span class="min-w-0 text-sm font-medium text-gray-800 [overflow-wrap:anywhere] dark:text-gray-200">
                   {{ item.name || `GID:${item.gid}` }}
                 </span>
                 <span
@@ -934,6 +1021,27 @@ async function handleBatchAddKnownFriendGids() {
                 }})
               </span>
             </button>
+            <label class="max-w-full flex flex-wrap items-center gap-2 text-sm">
+              最近登录
+              <select :value="loginFilter" :aria-describedby="showLoginTimeHint ? 'friend-login-missing-hint' : undefined" class="min-w-0 max-w-full border border-gray-200 rounded px-2 py-1 dark:border-gray-700 dark:bg-gray-800" @change="setLoginFilter">
+                <option value="all">全部</option>
+                <option value="inactive">超过指定天数未登录</option>
+                <option value="unknown">暂无登录时间</option>
+              </select>
+            </label>
+            <label v-if="loginFilter === 'inactive'" class="flex items-center gap-2 text-sm">
+              天数
+              <input
+                :value="inactiveDays"
+                type="number" min="1" :max="MAX_INACTIVE_DAYS" step="1"
+                :aria-invalid="!validInactiveDays"
+                class="w-24 border border-gray-200 rounded px-2 py-1 dark:border-gray-700 dark:bg-gray-800"
+                @input="setInactiveDays"
+              >
+            </label>
+            <p v-if="loginFilter === 'inactive' && !validInactiveDays" role="status" class="text-sm text-red-600 dark:text-red-400">
+              请输入 1 至 {{ MAX_INACTIVE_DAYS }} 的整数。
+            </p>
             <div class="flex-1" />
             <button
               class="rounded bg-gray-100 px-3 py-1.5 text-sm text-gray-600 transition dark:bg-gray-700 hover:bg-gray-200 dark:text-gray-300 disabled:opacity-50 dark:hover:bg-gray-600"
@@ -951,6 +1059,11 @@ async function handleBatchAddKnownFriendGids() {
               <div v-if="dogInfoLoading" class="i-svg-spinners-90-ring-with-bg mr-1 inline-block align-text-bottom" />
               获取狗信息
             </button>
+            <p v-if="showLoginTimeHint" id="friend-login-missing-hint" class="w-full text-sm text-gray-600 dark:text-gray-300">
+              {{ loginFilter === 'inactive'
+                ? '好友名单暂无可用的登录时间，暂时无法按天数筛选。'
+                : '游戏名单没有提供这些好友的可用登录时间，按天数筛选时会跳过。' }}
+            </p>
           </div>
 
           <FriendsFriendList
@@ -963,6 +1076,7 @@ async function handleBatchAddKnownFriendGids() {
             :watchlist-gid-set="watchlistGidSet"
             :auto-bad-gid-set="autoBadGidSet"
             :known-friend-gid-set="knownFriendGidSet"
+            :delete-disabled="friendDeletionDisabled"
             :expanded-friends="expandedFriends"
             :friend-lands="friendLands"
             :friend-lands-loading="friendLandsLoading"
@@ -980,6 +1094,7 @@ async function handleBatchAddKnownFriendGids() {
             @toggle-watchlist="handleToggleWatchlist"
             @toggle-auto-bad="handleToggleAutoBad"
             @remove-known-friend-gid="handleRemoveKnownFriendGid"
+            @delete-friend="requestFriendDeletion"
             @friend-avatar-error="handleFriendAvatarError"
           />
         </template>
@@ -1033,9 +1148,9 @@ async function handleBatchAddKnownFriendGids() {
           <div
             v-for="item in blacklist"
             :key="item.gid"
-            class="flex items-center justify-between rounded-lg bg-white p-4 shadow dark:bg-gray-800"
+            class="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-white p-4 shadow dark:bg-gray-800"
           >
-            <div class="flex items-center gap-3">
+            <div class="min-w-0 flex flex-auto items-start gap-3">
               <div class="h-10 w-10 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 ring-1 ring-gray-100 dark:bg-gray-600 dark:ring-gray-700">
                 <img
                   v-if="item.avatarUrl"
@@ -1046,13 +1161,13 @@ async function handleBatchAddKnownFriendGids() {
                 >
                 <div v-else class="i-carbon-user text-gray-400" />
               </div>
-              <div>
+              <div class="min-w-0 [overflow-wrap:anywhere]">
                 <span class="font-medium">{{ item.name || `GID:${item.gid}` }}</span>
                 <span class="ml-2 text-sm text-gray-400">({{ item.gid }})</span>
               </div>
             </div>
             <button
-              class="rounded bg-red-100 px-3 py-1.5 text-sm text-red-600 dark:bg-red-900/30 hover:bg-red-200 dark:text-red-400 dark:hover:bg-red-900/50"
+              class="min-h-11 shrink-0 whitespace-nowrap rounded bg-red-100 px-3 py-1.5 text-sm text-red-600 dark:bg-red-900/30 hover:bg-red-200 dark:text-red-400 dark:hover:bg-red-900/50"
               @click="handleRemoveFromBlacklist(item.gid)"
             >
               移出黑名单
@@ -1195,6 +1310,20 @@ async function handleBatchAddKnownFriendGids() {
       @close="!confirmLoading && (showConfirm = false)"
       @cancel="!confirmLoading && (showConfirm = false)"
     />
+
+    <Teleport to="body">
+      <ConfirmModal
+        :show="!!friendToDelete"
+        :loading="deletingFriend"
+        title="删除农场好友"
+        type="danger"
+        :message="friendToDelete ? `确定删除 ${friendToDelete.name}（GID ${friendToDelete.gid}）吗？删除后将解除农场好友关系。` : ''"
+        confirm-text="确认删除"
+        @confirm="confirmFriendDeletion"
+        @close="closeFriendDeletion"
+        @cancel="closeFriendDeletion"
+      />
+    </Teleport>
 
     <Teleport to="body">
       <div

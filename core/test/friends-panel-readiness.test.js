@@ -386,13 +386,14 @@ test('核心巡查/成熟墙钟刷新仍直接调用 getAllFriends，不进入�
 
 // ==================== 2. friend-api 微信分支类型守卫（行为） ====================
 
-function loadFriendApi({ types, sendMsgAsync }) {
+function loadFriendApi({ types, sendMsgAsync, removeFriendFromListCache, removeFriendFromCache = () => {} }) {
   const servicePath = require.resolve('../src/services/friend-api');
   const networkPath = require.resolve('../src/utils/network');
   const protoPath = require.resolve('../src/utils/proto');
   const storePath = require.resolve('../src/models/store');
   const interactPath = require.resolve('../src/services/interact');
   const paths = [servicePath, networkPath, protoPath, storePath, interactPath];
+  if (removeFriendFromListCache) paths.push(require.resolve('../src/services/friend-land-analyzer'));
   const previous = new Map(paths.map(file => [file, require.cache[file]]));
 
   require.cache[networkPath] = mockModule(networkPath, {
@@ -404,11 +405,15 @@ function loadFriendApi({ types, sendMsgAsync }) {
     getKnownFriendGids: () => [],
     applyConfigSnapshot: () => {},
     getFriendBlacklist: () => [],
-    removeFriendFromCache: () => {},
+    removeFriendFromCache,
   });
   require.cache[interactPath] = mockModule(interactPath, {
     getInteractRecords: async () => [],
   });
+  if (removeFriendFromListCache) {
+    const listPath = require.resolve('../src/services/friend-land-analyzer');
+    require.cache[listPath] = mockModule(listPath, { removeFriendFromListCache });
+  }
   delete require.cache[servicePath];
 
   const { CONFIG } = require('../src/config/config');
@@ -426,6 +431,41 @@ function loadFriendApi({ types, sendMsgAsync }) {
     },
   };
 }
+
+test('删除只提交指定好友，收到游戏回执后才清两级缓存', async () => {
+  const calls = [];
+  const removed = [];
+  const request = makeType();
+  request.encode = payload => ({ finish: () => payload });
+  let rejected = true;
+  const { service, restore } = loadFriendApi({
+    types: { DelFriendRequest: request, DelFriendReply: makeType() },
+    sendMsgAsync: async (serviceName, method, payload) => {
+      calls.push([serviceName, method, payload.friend_gid.toNumber()]);
+      if (rejected) throw new Error('fixture rejected');
+      return { body: {} };
+    },
+    removeFriendFromListCache: gid => removed.push(['memory', gid]),
+    removeFriendFromCache: (accountId, gid) => removed.push([accountId, gid]),
+  });
+  const account = process.env.FARM_ACCOUNT_ID;
+  process.env.FARM_ACCOUNT_ID = 'fixture-delete-account';
+  try {
+    await assert.rejects(service.delFriend(-7), /无效/);
+    await assert.rejects(service.delFriend(3.5), /无效/);
+    assert.deepEqual(calls, []);
+    await assert.rejects(service.delFriend(87), /fixture rejected/);
+    assert.deepEqual(removed, []);
+    rejected = false;
+    await service.delFriend(87);
+    assert.deepEqual(calls, Array.from({ length: 2 }, () => ['gamepb.friendpb.FriendService', 'DelFriend', 87]));
+    assert.deepEqual(removed, [['memory', 87], ['fixture-delete-account', 87]]);
+  } finally {
+    if (account === undefined) delete process.env.FARM_ACCOUNT_ID;
+    else process.env.FARM_ACCOUNT_ID = account;
+    restore();
+  }
+});
 
 test('微信分支缺少消息类型时编码前明确失败，零上游请求', async () => {
   const calls = [];
@@ -483,7 +523,7 @@ function makeDeferredGetAllFriends() {
   return { state, getAllFriends };
 }
 
-function loadAnalyzer({ getAllFriends, ripeSnapshot = null, enterFriendFarm }) {
+function loadAnalyzer({ getAllFriends, ripeSnapshot = null, enterFriendFarm, restoredRoster }) {
   const servicePath = require.resolve('../src/services/friend-land-analyzer');
   const friendApiPath = require.resolve('../src/services/friend-api');
   const networkPath = require.resolve('../src/utils/network');
@@ -492,6 +532,8 @@ function loadAnalyzer({ getAllFriends, ripeSnapshot = null, enterFriendFarm }) {
   const farmLandAnalyzerPath = require.resolve('../src/services/farm-land-analyzer');
   const paths = [servicePath, friendApiPath, networkPath, storePath,
     fertilizerPath, farmLandAnalyzerPath];
+  const businessPath = require.resolve('../src/services/business-state');
+  if (restoredRoster !== undefined) paths.push(businessPath);
   const previous = new Map(paths.map(file => [file, require.cache[file]]));
 
   require.cache[friendApiPath] = mockModule(friendApiPath, {
@@ -527,12 +569,26 @@ function loadAnalyzer({ getAllFriends, ripeSnapshot = null, enterFriendFarm }) {
   });
   delete require.cache[servicePath];
   const previousAccountId = process.env.FARM_ACCOUNT_ID;
+  const previousBusiness = process.env.FARM_SESSION_BUSINESS;
+  if (restoredRoster !== undefined) {
+    process.env.FARM_SESSION_BUSINESS = '1';
+    require.cache[businessPath] = mockModule(businessPath, {
+      wrapBusinessFunction: (_, fn) => fn,
+      registerDataState(key, capture, hydrate) {
+        if (key === 'services/friend-land-analyzer.js') {
+          hydrate({ friendsListCache: restoredRoster, friendsListGeneration: 1 });
+        }
+      },
+    });
+  }
   process.env.FARM_ACCOUNT_ID = 'friends-panel-readiness-test';
   return {
     service: require(servicePath),
     restore() {
       if (previousAccountId === undefined) delete process.env.FARM_ACCOUNT_ID;
       else process.env.FARM_ACCOUNT_ID = previousAccountId;
+      if (previousBusiness === undefined) delete process.env.FARM_SESSION_BUSINESS;
+      else process.env.FARM_SESSION_BUSINESS = previousBusiness;
       delete require.cache[servicePath];
       for (const file of paths) {
         if (previous.get(file)) require.cache[file] = previous.get(file);
@@ -543,6 +599,73 @@ function loadAnalyzer({ getAllFriends, ripeSnapshot = null, enterFriendFarm }) {
 }
 
 const replyWithGids = gids => ({ game_friends: gids.map(gid => ({ gid, name: `F${gid}`, level: 3 })) });
+
+test('保连接更新丢弃缺少登录字段的旧名单，保留已明确缺值的新名单', async () => {
+  const lastLogin = 1_770_000_000;
+  const { state, getAllFriends } = makeDeferredGetAllFriends();
+  const legacy = loadAnalyzer({
+    getAllFriends,
+    restoredRoster: [{ gid: 77, name: 'Old' }],
+  });
+  try {
+    const first = legacy.service.getFriendsList();
+    const second = legacy.service.getFriendsList();
+    assert.equal(state.calls, 1, 'first ordinary reads share a refresh');
+    state.pending[0].resolve({
+      game_friends: [{ gid: 77, name: 'Fresh', last_login: lastLogin }, { gid: 88, name: 'No service value' }],
+    });
+    const [fresh, same] = await Promise.all([first, second]);
+    assert.deepEqual(same, fresh);
+    assert.equal(fresh.find(friend => friend.gid === 77).lastLoginAt, lastLogin * 1000);
+    assert.equal(fresh.find(friend => friend.gid === 88).lastLoginAt, null);
+    await legacy.service.getFriendsList();
+    assert.equal(state.calls, 1, 'a confirmed missing value does not trigger extra reads');
+  } finally {
+    legacy.restore();
+  }
+
+  const current = loadAnalyzer({
+    getAllFriends,
+    restoredRoster: [{ gid: 88, name: 'No service value', lastLoginAt: null }],
+  });
+  try {
+    assert.equal((await current.service.getFriendsList())[0].lastLoginAt, null);
+    assert.equal(state.calls, 1);
+  } finally {
+    current.restore();
+  }
+});
+
+test('真实好友名单只将有效 last_login 秒或毫秒转成 DTO 时间', async () => {
+  const Long = require('long');
+  const recent = 1795000000;
+  const originalNow = Date.now;
+  Date.now = () => (recent + 3) * 1000;
+  const inputs = [
+    [recent, recent * 1000],
+    [Long.fromNumber(recent * 1000 + 123), recent * 1000 + 123],
+    [(recent + 3) * 1000, (recent + 3) * 1000],
+    [Long.ZERO, null], [undefined, null], [0, null], [NaN, null], [Infinity, null],
+    [-1, null], [1, null], [12_345, null], [1.5, null], [Long.MAX_VALUE, null], [Number.MAX_SAFE_INTEGER, null],
+    [recent + 4, null], [(recent + 3) * 1000 + 1, null], [true, null], [String(recent), null],
+  ];
+  let reads = 0;
+  const { service, restore } = loadAnalyzer({ getAllFriends: async () => {
+    reads++;
+    return { game_friends: inputs.map(([last_login], index) => ({
+      gid: index + 1, name: '测试好友', last_login, lastOnline: recent,
+    })) };
+  } });
+  try {
+    const results = await service.getFriendsList(true, { throwOnError: true });
+    assert.deepEqual(results.map(row => row.lastLoginAt), inputs.map(([, expected]) => expected));
+    assert.deepEqual((await service.getFriendsList(false)).map(row => row.lastLoginAt), inputs.map(([, expected]) => expected));
+    assert.equal(reads, 1);
+  } finally {
+    restore();
+    Date.now = originalNow;
+  }
+});
 
 test('并发好友列表请求（普通+强制混合）只触发一次上游读取并共享结果', async () => {
   const { state, getAllFriends } = makeDeferredGetAllFriends();
@@ -751,6 +874,29 @@ test('fetchFriendsDogInfo 的狗信息缓存写也走代次隔离：在途面板
       'dog-merged cache entry survives the concurrent panel read');
     assert.equal(cached[0].gid, 77);
     assert.equal(cached[0].dogId, 90021, 'guard dog info survives in the cache');
+  } finally {
+    restore();
+  }
+});
+
+test('已删除好友不会被在途名单和狗信息回包加回缓存', async () => {
+  const { state, getAllFriends } = makeDeferredGetAllFriends();
+  let releaseDog;
+  const { service, restore } = loadAnalyzer({
+    getAllFriends,
+    enterFriendFarm: () => new Promise(resolve => { releaseDog = resolve; }),
+  });
+  try {
+    service.setFriendsListCache([{ gid: 77, name: 'F77' }]);
+    const oldRoster = service.getFriendsList(true);
+    const oldDogInfo = service.fetchFriendsDogInfo();
+    await tick();
+    assert.equal(typeof releaseDog, 'function');
+    service.removeFriendFromListCache(77);
+    state.pending[0].resolve(replyWithGids([77]));
+    releaseDog({ lands: [], __briefDogInfo: { dogId: 90021 } });
+    await Promise.all([oldRoster, oldDogInfo]);
+    assert.deepEqual(service.getFriendsListCache(), []);
   } finally {
     restore();
   }

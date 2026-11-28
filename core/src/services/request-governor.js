@@ -11,8 +11,40 @@
 const WINDOW_MS = 60 * 1000;
 // 预算从 40/15 放宽到 80/30：正常多账号巡查 + 收获 + ACE 上报的合理峰值
 // 不该被拦，预算只削真正的异常风暴
-const TOTAL_LIMIT = Number(process.env.FARM_REQUEST_LIMIT_60S) || 80;
-const PER_METHOD_LIMIT = Number(process.env.FARM_REQUEST_METHOD_LIMIT_60S) || 30;
+const { DEFAULT_REQUEST_POLICY, validateRequestPolicy, totalBudgetForRoster } = require('./request-policy');
+const TOTAL_LIMIT = DEFAULT_REQUEST_POLICY.total60s;
+const PER_METHOD_LIMIT = DEFAULT_REQUEST_POLICY.method60s;
+let policy = { ...DEFAULT_REQUEST_POLICY };
+let rosterSize = 0;
+function configurePolicy(value) { policy = validateRequestPolicy(value); return { ...policy }; }
+function setRosterSize(count) {
+    if (!Number.isSafeInteger(count) || count < 0) return false;
+    rosterSize = count;
+    return true;
+}
+function effectiveTotalBudget(totalLimit, now) {
+    return watchModeActive(now) ? Math.floor(totalLimit * 1.5) : totalLimit;
+}
+
+// Classify the encoded target at the physical transport, including manual and fallback callers.
+function isFriendRequest(service, method, body, ownGid) {
+    if (service === 'gamepb.friendpb.FriendService' || service === 'gamepb.visitpb.VisitService') return true;
+    if (service === 'gamepb.userpb.UserService' && ['BatchGetBasicInfo', 'GetBriefInfo'].includes(method)) return true;
+    if ((service === 'gamepb.animalpb.AnimalService' && ['GetRanchDetail', 'StealProduce'].includes(method))
+        || (service === 'gamepb.animalpb.RanchService' && ['CleanAllRanch', 'StrokeAnimal', 'PutHazard'].includes(method))) {
+        try {
+            const target = require('./ranch-codec').decode(`${method}Request`, body).host_gid;
+            return target !== '0' && target !== String(ownGid || '0');
+        } catch { return true; }
+    }
+    if (service !== 'gamepb.plantpb.PlantService'
+        || !['AllLands', 'Harvest', 'WaterLand', 'Farming', 'WeedOut', 'Insecticide', 'PutInsects', 'PutWeeds', 'PutSocialItem', 'CheckCanOperate'].includes(method)) return false;
+    try {
+        const type = require('../utils/proto').types[`${method}Request`];
+        const target = String(type.decode(body).host_gid || '0');
+        return target !== '0' && target !== String(ownGid || '0');
+    } catch { return true; } // Unknown target cannot become a friend-budget exemption.
+}
 // 白名单：防封兜底与核心链路的关键请求不受预算限制（仍计入画像）
 // AntiData 是官方客户端固定节奏的 ACE 风控上报；心跳是 userpb.UserService.Heartbeat
 const WHITELIST = new Set([
@@ -104,10 +136,12 @@ function methodKey(serviceName, methodName) {
  * 发送前过闸。返回 { allowed, reason }。
  * allowed=false 时调用方应静默跳过（返回错误让既有 catch 路径处理）。
  */
-function checkRequest(serviceName, methodName, now = Date.now()) {
+function checkRequest(serviceName, methodName, now = Date.now(), options = {}) {
     pruneWindow(now);
     const key = methodKey(serviceName, methodName);
-    const whitelisted = WHITELIST.has(key) || STEAL_WHITELIST_RE.test(key);
+    if (!policy.enabled) return { allowed: true, reason: 'disabled' };
+    const whitelisted = WHITELIST.has(key) || (STEAL_WHITELIST_RE.test(key)
+        && key !== 'gamepb.animalpb.AnimalService.StealProduce');
     // 异常阈值只通知上层降低普通巡查节奏，不在这里整号拒绝业务请求。
     // 成熟抢收仍受下面的 60s 总量/单方法硬预算保护。
     if (whitelisted) return { allowed: true, reason: 'whitelist' };
@@ -120,19 +154,24 @@ function checkRequest(serviceName, methodName, now = Date.now()) {
 
     // 施肥 HOT 内总预算同步放宽（目标好友需要高频往返，80/min 的常规预算
     // 会被盯梢+常规巡查挤满，导致 Enter 被拦、盯哨失明）
-    const totalLimit = watchModeActive(now) ? Math.floor(TOTAL_LIMIT * 1.5) : TOTAL_LIMIT;
+    const totalLimit = effectiveTotalBudget(totalBudgetForRoster(policy, rosterSize), now);
     if (windowEvents.length >= totalLimit) {
         droppedTotal++;
         return { allowed: false, reason: 'budget_total' };
     }
     // 施肥 HOT 内的进门/读地块放宽单接口限值。
     const methodLimit = WATCHMODE_METHODS.has(key) && watchModeActive(now)
-        ? PER_METHOD_LIMIT * WATCHMODE_BOOST
-        : PER_METHOD_LIMIT;
+        ? policy.method60s * WATCHMODE_BOOST
+        : policy.method60s;
     const methodCount = windowEvents.filter(e => e.key === key).length;
     if (methodCount >= methodLimit) {
         droppedTotal++;
         return { allowed: false, reason: 'budget_method' };
+    }
+    const friendLimit = watchModeActive(now) ? Math.floor(policy.friend60s * 1.5) : policy.friend60s;
+    if (options.friend === true && windowEvents.filter(e => e.friend).length >= friendLimit) {
+        droppedTotal++;
+        return { allowed: false, reason: 'budget_friend' };
     }
     return { allowed: true, reason: 'ok' };
 }
@@ -141,7 +180,7 @@ function checkRequest(serviceName, methodName, now = Date.now()) {
 function recordSent(serviceName, methodName, ok, now = Date.now(), options = {}) {
     pruneWindow(now);
     const key = methodKey(serviceName, methodName);
-    windowEvents.push({ at: now, key, ok: ok !== false });
+    windowEvents.push({ at: now, key, ok: ok !== false, friend: options.friend === true });
     if (ok === false) {
         // 施肥 HOT / 成熟竞速中的目标链路失败不计入异常阈值：它们通常只是状态竞争。
         // 此外，调用方可把明确的只读探测“业务错误”标为 breakerExempt；网络超时、
@@ -150,7 +189,7 @@ function recordSent(serviceName, methodName, ok, now = Date.now(), options = {})
             && (watchModeActive(now) || contentionModeActive(now));
         if (!inContention && options.breakerExempt !== true) {
             errEvents.push({ at: now, key });
-            if (errEvents.length >= BREAKER_ERR_LIMIT && now >= slowdownUntil) {
+            if (policy.enabled && errEvents.length >= BREAKER_ERR_LIMIT && now >= slowdownUntil) {
                 const slowdown = SLOWDOWN_MIN_MS
                     + Math.floor(Math.random() * (SLOWDOWN_MAX_MS - SLOWDOWN_MIN_MS));
                 const failures = [...errEvents.reduce((counts, item) => {
@@ -203,6 +242,7 @@ function clearBreaker() {
 /** 画像：给每日安全巡检的事实输入 */
 function getRequestProfile(now = Date.now()) {
     pruneWindow(now);
+    const totalLimit = totalBudgetForRoster(policy, rosterSize);
     const byMethod = new Map();
     for (const e of windowEvents) {
         const item = byMethod.get(e.key) || { count: 0, errCount: 0 };
@@ -216,14 +256,22 @@ function getRequestProfile(now = Date.now()) {
         .slice(0, 12);
     return {
         windowMs: WINDOW_MS,
-        totalLimit: TOTAL_LIMIT,
-        perMethodLimit: PER_METHOD_LIMIT,
+        policySupported: true,
+        enabled: policy.enabled,
+        policy: { ...policy },
+        rosterSize,
+        totalLimit,
+        effectiveTotalLimit: effectiveTotalBudget(totalLimit, now),
+        friendLimit: policy.friend60s,
+        effectiveFriendLimit: watchModeActive(now) ? Math.floor(policy.friend60s * 1.5) : policy.friend60s,
+        friendCount: windowEvents.filter(e => e.friend).length,
+        perMethodLimit: policy.method60s,
         watchModeActive: watchModeActive(now),
         contentionModeActive: contentionModeActive(now),
         watchModeBoost: WATCHMODE_BOOST,
         windowCount: windowEvents.length,
         droppedTotal,
-        slowdownActive: now < slowdownUntil,
+        slowdownActive: policy.enabled && now < slowdownUntil,
         slowdownUntil,
         slowdownCount,
         // 兼容旧画像字段，但明确不存在硬熔断。
@@ -236,7 +284,7 @@ function getRequestProfile(now = Date.now()) {
 
 function getBreakerState(now = Date.now()) {
     return {
-        active: now < slowdownUntil,
+        active: policy.enabled && now < slowdownUntil,
         until: slowdownUntil,
         count: slowdownCount,
         mode: 'slowdown',
@@ -247,6 +295,8 @@ function getBreakerState(now = Date.now()) {
 
 /** 测试用：清空全部状态 */
 function resetForTest() {
+    policy = { ...DEFAULT_REQUEST_POLICY };
+    rosterSize = 0;
     windowEvents.length = 0;
     errEvents.length = 0;
     slowdownUntil = 0;
@@ -257,6 +307,7 @@ function resetForTest() {
 }
 
 module.exports = {
+    configurePolicy, setRosterSize, isFriendRequest,
     checkRequest,
     recordSent,
     getRequestProfile,

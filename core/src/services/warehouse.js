@@ -42,7 +42,6 @@ const {
   getPlantBySeedId,
   getItemById,
   getItemImageById,
-  getSeedLevel,
   getSeedImageBySeedId,
   getSeedImageByName,
   getPlantImageByPhase,
@@ -212,7 +211,14 @@ function toSellItem(raw, exactMaterial = false) {
   return item;
 }
 
+function assertBagItemActionable(itemId) {
+  if (getItemById(itemId)?.catalogOnly) {
+    throw Object.assign(new Error('该物品仅用于目录展示，暂无背包操作'), { code: 'BAG_ITEM_CATALOG_ONLY' });
+  }
+}
+
 async function sellItems(items) {
+  for (const item of items) assertBagItemActionable(item?.id);
   const materials = require('../gameConfig/MilkTeaActivity.json').recipes;
   if (items.some(item => materials.some(row => row.fruitItemId > 0 && row.fruitItemId === toNum(item?.id)))) {
     return require('./milk-tea-activity').withMilkTeaMaterialSale(items, () => sendSellItems(items, true));
@@ -236,6 +242,7 @@ async function sendSellItems(items, exactMaterials = false) {
 async function useItem(itemId, count = 1, uid = 0) {
   const { decimalOf, assertPositiveInt } = require('./manual-commerce');
   const idText = assertPositiveInt(itemId, '物品编号');
+  assertBagItemActionable(idText);
   const countText = assertPositiveInt(count, '使用数量');
   let itemUid = decimalOf(uid);
   if (!itemUid) throw new Error('物品 UID 必须为精确的非负64位整数');
@@ -267,7 +274,9 @@ async function batchUseItems(entries) {
   const items = (entries || []).map((e) => {
     const uid = decimalOf(e.uid ?? 0);
     if (!uid) throw new Error('物品 UID 必须为精确的非负64位整数');
-    return { id: toLong(assertPositiveInt(e.itemId, '物品编号')),
+    const id = assertPositiveInt(e.itemId, '物品编号');
+    assertBagItemActionable(id);
+    return { id: toLong(id),
       count: toLong(assertPositiveInt(e.count ?? 1, '使用数量')), uid: toLong(uid) };
   });
 
@@ -581,11 +590,13 @@ async function getBagDetail() {
     if (!name) name = `物品${  id}`;
 
     const interactionType = info && info.interaction_type ? String(info.interaction_type) : '';
-    const priceId = info ? Number(info.price_id) || 0 : 0;
-    const directSell = String(info && info.sells || '').match(/^(\d+):(\d+)$/);
+    const catalogOnly = info?.catalogOnly === true;
+    const priceInfo = catalogOnly ? undefined : info;
+    const priceId = Number(priceInfo?.price_id) || 0;
+    const directSell = String(priceInfo?.sells || '').match(/^(\d+):(\d+)$/);
     const effectivePriceId = directSell ? Number(directSell[1]) : priceId;
-    const effectivePrice = directSell ? Number(directSell[2]) : (info ? Number(info.price) || 0 : 0);
-    const priceDec = directSell ? directSell[2] : (info && info.price != null ? String(info.price) : '0');
+    const effectivePrice = directSell ? Number(directSell[2]) : Number(priceInfo?.price) || 0;
+    const priceDec = directSell ? directSell[2] : String(priceInfo?.price ?? 0);
     const priceUnit =
       effectivePriceId === 1005 ? '金豆豆' :
       effectivePriceId === 200 ? '点券' : '金';
@@ -603,9 +614,10 @@ async function getBagDetail() {
         priceId: effectivePriceId,
         price: effectivePrice,
         priceDec,
-        priceUnit,
+        priceUnit: catalogOnly ? '' : priceUnit,
+        ...(catalogOnly ? { catalogOnly: true } : {}),
         sellable: Boolean(directSell || getPlantByFruitId(id)),
-        usable: Number(info && info.can_use) === 1 || interactionType === 'use',
+        usable: !catalogOnly && (Number(info && info.can_use) === 1 || interactionType === 'use'),
         level: info ? Number(info.level) || 0 : 0,
         plantSize: seedPlant ? Math.max(1, Number(seedPlant.size || 1)) : category === 'seed' ? 0 : 1,
         interactionType,
@@ -827,10 +839,14 @@ const lastUnclassifiedReportedIds = new Set();
 let lastFallbackSeedSignature = '';
 const lastFallbackSeedReportedIds = new Set();
 
+function sampleUnclassifiedIds(ids) {
+  return [...ids].sort((a, b) => a - b).slice(0, 20);
+}
+
 function getBagSeedsFromItems(items) {
   const seedMap = new Map();
   const fallbackSeedIds = [];
-  const unclassifiedIds = [];
+  const unknownIds = new Set();
 
   for (const item of items || []) {
     const id = toNum(item && item.id);
@@ -845,7 +861,7 @@ function getBagSeedsFromItems(items) {
     if (!seedLike) {
       // 只记录本地索引完全没有条目的未知物品（可能是新活动种子/道具）；
       // 已知果实、化肥、货币等非种子物品不算识别缺口，不记录避免刷屏。
-      if (!info && unclassifiedIds.length < 20) unclassifiedIds.push(id);
+      if (!info && Number.isFinite(id)) unknownIds.add(id);
       continue;
     }
 
@@ -857,7 +873,7 @@ function getBagSeedsFromItems(items) {
     const name = rawName.endsWith('??') ? rawName.slice(0, -2) : rawName;
     const requiredLevel = plant
       ? Math.max(0, Number(plant.land_level_need || 0))
-      : Math.max(0, Number(info && info.level || getSeedLevel(id) || 0));
+      : 0; // ItemInfo.level is display metadata; an unmapped seed has no verified land requirement.
     const plantSize = plant ? Math.max(1, Number(plant.size || 1)) : 0;
 
     const existing = seedMap.get(id) || {
@@ -876,14 +892,14 @@ function getBagSeedsFromItems(items) {
     seedMap.set(id, existing);
   }
 
-  // 面板刷屏修复：未识别清单没有变化时不重复打日志（Bag 每个农场 tick 都读一次，
-  // 原实现同一批未知物品会每轮刷一条）。签名变化（新增/消失）时才报。
+  // 先去重、排序再采样，使签名与背包行顺序和重复行无关。
+  const unclassifiedIds = sampleUnclassifiedIds(unknownIds);
   const unclassifiedSignature = unclassifiedIds.join(',');
   if (unclassifiedIds.length > 0 && unclassifiedSignature !== lastUnclassifiedSignature) {
     lastUnclassifiedSignature = unclassifiedSignature;
     const added = unclassifiedIds.filter(id => !lastUnclassifiedReportedIds.has(id));
     for (const id of unclassifiedIds) lastUnclassifiedReportedIds.add(id);
-    log('warehouse', `bag contains items missing from local item index: ${unclassifiedIds.join(',')}`, {
+    log('warehouse', `bag contains items missing from local item index: ${unclassifiedSignature}`, {
       module: 'warehouse',
       event: 'bag_unclassified_item',
       result: 'unknown_item_ids',
@@ -986,7 +1002,9 @@ if (globalThis.process?.env?.FARM_SESSION_BUSINESS === '1') {
       panelBagCache = value.panelBagCache;
       panelBagCacheAt = value.panelBagCacheAt;
       panelBagRetryAfter = value.panelBagRetryAfter;
-      lastUnclassifiedSignature = value.lastUnclassifiedSignature;
+      const previousIds = new Set(value.lastUnclassifiedSignature.split(',').map(Number)
+        .filter(id => Number.isFinite(id) && id > 0));
+      lastUnclassifiedSignature = sampleUnclassifiedIds(previousIds).join(',');
       restoreContainer(lastUnclassifiedReportedIds, value.lastUnclassifiedReportedIds);
       lastFallbackSeedSignature = value.lastFallbackSeedSignature;
       restoreContainer(lastFallbackSeedReportedIds, value.lastFallbackSeedReportedIds);

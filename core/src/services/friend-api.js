@@ -37,7 +37,7 @@ const {
   getFriendBlacklist,
   removeFriendFromCache,
 } = require('../models/store');
-const { sendMsgAsync } = require('../utils/network');
+const { sendMsgAsync, getUserState } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { toLong, toNum, log, logWarn, randomDelay } = require('../utils/utils');
 const { getInteractRecords } = require('./interact');
@@ -724,6 +724,7 @@ function recordRosterReply(reply, reqSeq) {
   latestSuccessfulSeq = seq;
   const friends = Array.isArray(reply) ? reply : extractReplyFriends(reply);
   const names = {};
+  const ranchSummaries = {};
   try {
     const { noteFriendName } = require('./friend-activity');
     for (const friend of friends) {
@@ -735,10 +736,18 @@ function recordRosterReply(reply, reqSeq) {
       noteFriendName(gid, name);
     }
   } catch { /* 名字缺失不影响名册快照 */ }
+  for (const friend of friends) {
+    const gid = toNum(friend?.gid);
+    const ranch = friend?.big_farm_status;
+    if (gid && ranch && (ranch.can_steal === true || ranch.can_help === true)) {
+      ranchSummaries[gid] = { canSteal: ranch.can_steal === true, canHelp: ranch.can_help === true };
+    }
+  }
   rosterSnapshot = {
     gids: normalizeFriendGids(friends.map(f => f && f.gid)).sort((a, b) => a - b),
     names,
     at: Date.now(),
+    ...(Object.keys(ranchSummaries).length && { ranchSummaries }),
   };
   return rosterSnapshot;
 }
@@ -761,6 +770,15 @@ async function getAllFriends(_forceRefresh = false, observer = null) {
   let ok = false;
   try {
     const reply = await getAllFriendsObserved(reqSeq, obs);
+    if (!obs.state.partial && reqSeq === latestSuccessfulSeq) {
+      try {
+        const self = toNum(getUserState?.()?.gid);
+        const realFriends = extractReplyFriends(reply).filter(friend => friend && toNum(friend.gid) !== self
+          && !(toNum(friend.level) === 1 && (friend.name === '小小农夫' || friend.remark === '小小农夫')));
+        const count = normalizeFriendGids(realFriends.map(friend => friend.gid)).length;
+        require('./request-governor').setRosterSize?.(count);
+      } catch { /* Existing resident hosts may not support roster-based budgets yet. */ }
+    }
     ok = true;
     return reply;
   } catch (err) {
@@ -865,7 +883,7 @@ async function acceptFriends(gids) {
 /** Delete a friend by GID. */
 async function delFriend(gid) {
   const numericGid = toNum(gid);
-  if (!numericGid) throw new Error('无效的好友 GID');
+  if (!Number.isSafeInteger(numericGid) || numericGid <= 0) throw new Error('无效的好友 GID');
 
   const payload = types.DelFriendRequest.encode(
     types.DelFriendRequest.create({ friend_gid: toLong(numericGid) })
@@ -877,7 +895,7 @@ async function delFriend(gid) {
   );
   const reply = types.DelFriendReply.decode(body);
 
-  // Remove from local cache
+  require('./friend-land-analyzer').removeFriendFromListCache(numericGid);
   const accountId = process.env.FARM_ACCOUNT_ID || '';
   if (accountId) {
     removeFriendFromCache(accountId, numericGid);

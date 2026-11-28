@@ -13,7 +13,7 @@ const MAX_EVENTS = 200; // 单日上限，够看且防刷爆
 
 const accounts = new Map(); // accountId -> { date, events: [] }
 const automationCleanupDays = new Map();
-const AUTOMATION_CATEGORIES = new Set(['task', 'rewards', 'warehouse', 'fertilizer', 'land', 'shop', 'friend', 'activity', 'login']);
+const AUTOMATION_CATEGORIES = new Set(['task', 'rewards', 'warehouse', 'fertilizer', 'land', 'shop', 'friend', 'activity', 'ranch', 'login']);
 
 function automationFile(accountId, day = todayKey()) {
   const id = String(accountId || 'default');
@@ -196,6 +196,13 @@ function sanitizeShareableMessage(event, runtimeTerms) {
     if (countMatch && Number.isInteger(countMatch.index)) {
       const suffix = message.slice(countMatch.index + countMatch[0].length);
       message = `偷取 好友 ${countMatch[1]} 个${suffix}`;
+    }
+  }
+  if (type === 'auto_ranch') {
+    const label = ['自动偷取好友牧场产物', '自动帮好友清理牧场'].find(value => message.startsWith(`${value}（`));
+    if (label) {
+      const receipt = message.match(/）已确认 · (\d+)\/\d+ 项/u);
+      message = `${label}已确认${receipt ? ` · ${receipt[1]} 项` : ''}`;
     }
   }
   return message

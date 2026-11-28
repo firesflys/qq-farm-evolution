@@ -20,7 +20,10 @@ function createHarness(name) {
   const localProcess = { env: { FARM_DATA_DIR: dataRoot, FARM_ACCOUNT_ID: 'synthetic-heartbeat-offline', NODE_TEST_CONTEXT: 'offline-fixture' } };
   const governorModule = { exports: {} };
   vm.runInNewContext(rawGovernor, { module: governorModule, exports: governorModule.exports, Date: Clock,
-    process: localProcess, Math, require: name => { throw new Error(`Unexpected governor dependency: ${  name}`); } }, { filename: governorFile });
+    process: localProcess, Math, require: name => {
+      if (name === './request-policy') return require('../src/services/request-policy');
+      throw new Error(`Unexpected governor dependency: ${name}`);
+    } }, { filename: governorFile });
   const governor = governorModule.exports;
   const scheduler = {
     setIntervalTask(key, delay, callback) { timers.set(key, { at: now + delay, interval: delay, callback }); },
@@ -55,6 +58,8 @@ function createHarness(name) {
   } };
   const store = { getWirePauseRemainMs: () => pauseMs, getDeviceProtocolForAccount: () => null };
   const replacements = {
+    'node:crypto': require('node:crypto'),
+    '../runtime/ranch-scene-binding': require('../src/runtime/ranch-scene-binding'),
     'node:perf_hooks': { performance: { now: () => now - baseNow } }, 'node:buffer': { Buffer }, 'node:events': EventEmitter, 'node:process': localProcess, ws: Socket,
     '../config/config': { CONFIG: config }, '../services/ace-service': { AceService: class { constructor() { throw new Error('Unexpected ACE initialization'); } } },
     '../services/scheduler': { createScheduler: namespace => { assert.equal(namespace, 'network'); return scheduler; } },

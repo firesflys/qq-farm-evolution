@@ -76,6 +76,7 @@ function createDataProvider(deps) {
             return JSON.stringify([id, bindingIdentity(account), panelWorkerIds.get(worker),
                 facts?.host?.hostId || '', facts?.game?.connectionEpoch || '', facts?.game?.loginEpoch || '', facts?.business?.epoch || '']);
         },
+        feedDog: (ref, request) => callWorkerApi(resolveAccountId(ref), 'feedDog', request),
         getDogReadPanel: (ref) => callWorkerApi(resolveAccountId(ref), 'getDogReadPanel'),
         getCollectionReadPanel: (ref) => callWorkerApi(resolveAccountId(ref), 'getCollectionReadPanel'),
         prepareWxRestart: deps.prepareWxRestart,
@@ -93,6 +94,10 @@ function createDataProvider(deps) {
             return {
                 ...buildDefaultStatus(id),
                 ...normalizeStatusForPanel(worker.status, id, worker.name),
+                sessionUpgrade: worker.process?.persistentSession ? {
+                    requiresRescan: worker.process.sessionFacts?.game?.requestPolicy?.supported !== true,
+                    requestPolicy: worker.process.sessionFacts?.game?.requestPolicy || null,
+                } : null,
                 wsError: worker.wsError || null
             };
         },
@@ -181,7 +186,7 @@ function createDataProvider(deps) {
         doFarmOp: (ref, op) => callWorkerApi(resolveAccountId(ref), 'doFarmOp', op),
         buyFertilizer: (ref, type, count) => callWorkerApi(resolveAccountId(ref), 'buyFertilizer', type, count),
         checkAndBuyFertilizer: (ref, opts) => callWorkerApi(resolveAccountId(ref), 'checkAndBuyFertilizer', opts),
-        fertilizeLand: (ref, landId) => callWorkerApi(resolveAccountId(ref), 'fertilizeLand', landId),
+        fertilizeLand: (ref, landId, fertilizerType = 'organic') => callWorkerApi(resolveAccountId(ref), 'fertilizeLand', landId, fertilizerType),
         removePlant: (ref, landId) => callWorkerApi(resolveAccountId(ref), 'removePlant', landId),
         removeAllPlants: (ref) => callWorkerApi(resolveAccountId(ref), 'removeAllPlants'),
         getShopInfo: (ref, shopId) => callWorkerApi(resolveAccountId(ref), 'getShopInfo', shopId),
@@ -240,7 +245,23 @@ function createDataProvider(deps) {
         buyMysteryShopGoods: (ref, npcId) => callWorkerApi(resolveAccountId(ref), 'buyMysteryShopGoods', npcId),
         abandonMysteryShop: (ref) => callWorkerApi(resolveAccountId(ref), 'abandonMysteryShop'),
 
+        getRanchFriend: (ref, host) => callWorkerApi(resolveAccountId(ref), 'getRanchFriend', host, { _timeoutMs: 25000 }),
+        getRanchCleanOperation: (ref, id) => callWorkerApi(resolveAccountId(ref), 'getRanchCleanOperation', id),
+        reportRanchFriendPanel: ref => callWorkerApi(resolveAccountId(ref), 'reportRanchFriendPanel', { _timeoutMs: 25000 }),
+        getRanchState: (ref, view, shopId) => callWorkerApi(resolveAccountId(ref), 'getRanchState', view, shopId, { _timeoutMs: 25000 }),
+        getRanchAutomation: ref => callWorkerApi(resolveAccountId(ref), 'getRanchAutomation'),
+        setRanchAutomation: (ref, value) => callWorkerApi(resolveAccountId(ref), 'setRanchAutomation', value),
+        prepareRanchAction: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'prepareRanchAction', action, input, { _timeoutMs: 25000 }),
+        operateRanch: (ref, id) => callWorkerApi(resolveAccountId(ref), 'operateRanch', id, { _timeoutMs: 25000 }),
+        cancelRanchAction: (ref, id) => callWorkerApi(resolveAccountId(ref), 'cancelRanchAction', id),
+        acknowledgeRanch: (ref, id) => callWorkerApi(resolveAccountId(ref), 'acknowledgeRanch', id),
+
         // ========== Activity ==========
+        getMugeActivity: ref => callWorkerApi(resolveAccountId(ref), 'getMugeActivity', { _timeoutMs: 15000 }),
+        getSweetPotatoReadScope: ref => callWorkerApi(resolveAccountId(ref), 'getSweetPotatoReadScope', { _timeoutMs: 2500 }),
+        getSweetPotatoActivity: (ref, scope) => callWorkerApi(resolveAccountId(ref), 'getSweetPotatoActivity', scope, { _timeoutMs: 45000 }),
+        runSweetPotatoTrade: (ref, action, params, scope) => callWorkerApi(resolveAccountId(ref), 'runSweetPotatoTrade', action, params, scope, { _timeoutMs: 90000 }),
+        operateMuge: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'operateMuge', action, input, { _timeoutMs: 45000 }),
         getActivityDiscoveryList: (ref) => callWorkerApi(resolveAccountId(ref), 'getActivityDiscoveryList'),
         getOfficialAnnouncements: (ref) => callWorkerApi(resolveAccountId(ref), 'getOfficialAnnouncements'),
         // 只读双箱邮件快照与一次有界更新证据采集（Worker 侧 60s 缓存共享）
@@ -275,7 +296,9 @@ function createDataProvider(deps) {
             const id = resolveAccountId(ref);
             if (!id) throw new Error('Missing x-account-id');
             const s = settings && typeof settings === 'object' ? settings : {};
+            if (s.requestPolicy !== undefined) require('../services/request-policy').validateRequestPolicy(s.requestPolicy);
             const patch = {
+                requestPolicy: s.requestPolicy,
                 plantingStrategy: s.plantingStrategy !== undefined ? s.plantingStrategy : s.strategy,
                 preferredSeedId: s.preferredSeedId !== undefined ? s.preferredSeedId : s.seedId,
                 prioritize2x2Crops: s.prioritize2x2Crops,
@@ -305,6 +328,7 @@ function createDataProvider(deps) {
                 scheduleAutoCodeRefresh(id);
             }
             return {
+                requestPolicy: store.getConfigSnapshot(id).requestPolicy,
                 strategy: store.getPlantingStrategy(id),
                 preferredSeed: store.getPreferredSeed(id),
                 prioritize2x2Crops: store.getPrioritize2x2Crops(id),
@@ -466,11 +490,12 @@ function createDataProvider(deps) {
         // 自助扫码已换发并落盘新 Code，直接沿现有 Worker 路径恢复，避免再次换码。
         // startWorker 是纯取值器（true=已拉起 / false=拒绝），必须如实透传：
         // 不能把「新授权已保存」冒充成「账号已启动」（2026-10-04 授权后未登录事故）。
-        startAccountFromSavedWxCode: (ref, expectedCode) => {
+        startAccountFromSavedWxCode: (ref, expectedCode, expectedGeneration) => {
             const id = resolveAccountId(ref);
             const account = findAccount(id || ref);
             if (!account || account.platform !== 'wx' || !account.loginBuffer
-                || !expectedCode || account.code !== expectedCode) return false;
+                || !expectedCode || account.code !== expectedCode
+                || (expectedGeneration !== undefined && (account.credentialGeneration !== expectedGeneration || account.autoLogin === false))) return false;
             store.addOrUpdateAccount({ id: account.id, autoLogin: true });
             if (typeof scheduleAutoCodeRefresh === 'function') scheduleAutoCodeRefresh(account.id);
             return startWorker(findAccount(id || ref) || account);
@@ -514,14 +539,14 @@ function createDataProvider(deps) {
             return result && typeof result.then === 'function' ? result.then(() => true) : true;
         },
 
-        restartAccount: (ref) => {
+        restartAccount: (ref, options) => {
             const id = resolveAccountId(ref);
             const account = findAccount(id || ref);
             if (!account) return false;
             // restartWorker：true/false = 同步 startWorker 的结果；undefined = 重启
             // 已排队（等旧进程退出后拉起）。原样透传，调用方据此区分「已提交
             // 重连」与「真正启动」，绝不把排队冒充已连接。
-            return restartWorker(account);
+            return restartWorker(account, options);
         },
 
         isAccountRunning: (ref) => {

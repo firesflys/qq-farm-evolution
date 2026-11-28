@@ -13,6 +13,27 @@ const activityRouteSrc = fs.readFileSync(
     'utf8'
 );
 
+test('friend ranch reads and writes use the friend budget without charging own cleanup as a visit', () => {
+    const codec = require('../src/services/ranch-codec');
+    governor.resetForTest();
+    for (const key of ['friendDetail', 'stealFriend', 'clean']) {
+        const { service, method, request } = codec.ROUTES[key];
+        for (const [host_gid, expected] of [['73', true], ['42', false], ['0', false]]) {
+            assert.equal(governor.isFriendRequest(service, method, codec.encode(request, { host_gid }), '42'), expected, key);
+        }
+    }
+    const actor = { friend: true };
+    const { service, method } = codec.ROUTES.stealFriend;
+    governor.configurePolicy({ enabled: true, total60s: 80, friend60s: 2, method60s: 15 });
+    try {
+        governor.recordSent('gamepb.visitpb.VisitService', 'Enter', true, T0, actor);
+        governor.recordSent('gamepb.visitpb.VisitService', 'Leave', true, T0, actor);
+        assert.equal(governor.checkRequest(service, method, T0, actor).reason, 'budget_friend');
+    } finally {
+        governor.resetForTest();
+    }
+});
+
 test('total budget drops non-whitelisted requests beyond the 60s limit', () => {
     governor.resetForTest();
     for (let i = 0; i < governor.TOTAL_LIMIT; i++) {
@@ -37,6 +58,43 @@ test('whitelist and steal methods bypass the budget', () => {
     assert.equal(ace.reason, 'whitelist');
     const steal = governor.checkRequest('gamepb.plantpb.PlantService', 'Harvest', T0 + 2000);
     assert.equal(steal.allowed, true);
+});
+
+test('total budget scales with the roster and reports the same cap used in admission', () => {
+    const at = T0 + 1000;
+    governor.resetForTest();
+    governor.configurePolicy({ enabled: true, total60s: 80, friend60s: 40, method60s: 30 });
+    try {
+        for (const [friends, limit] of [[0, 80], [5, 81], [100, 100], [500, 180]]) {
+            assert.equal(governor.setRosterSize(friends), true);
+            const profile = governor.getRequestProfile(at);
+            assert.equal(profile.rosterSize, friends);
+            assert.equal(profile.totalLimit, limit);
+            assert.equal(profile.effectiveTotalLimit, limit);
+            assert.deepEqual([profile.policy.total60s, profile.friendLimit, profile.perMethodLimit], [80, 40, 30]);
+        }
+        for (let i = 0; i < 180; i++) {
+            const method = `Read${i}`;
+            assert.equal(governor.checkRequest('svc.Farm', method, at).allowed, true);
+            governor.recordSent('svc.Farm', method, true, at);
+        }
+        assert.equal(governor.checkRequest('svc.Farm', 'Next', at).reason, 'budget_total');
+        governor.setWatchMode(true, at + 10000);
+        assert.equal(governor.getRequestProfile(at).effectiveTotalLimit, 270);
+        assert.equal(governor.checkRequest('svc.Farm', 'Next', at).allowed, true);
+        assert.equal(governor.setRosterSize(-1), false);
+        assert.equal(governor.getRequestProfile(at).rosterSize, 500);
+        governor.configurePolicy({ enabled: true, total60s: 9950, friend60s: 40, method60s: 30 });
+        assert.equal(governor.getRequestProfile(at).totalLimit, 10000);
+        governor.setWatchMode(false);
+        governor.setRosterSize(0);
+        assert.equal(governor.getRequestProfile(at).effectiveTotalLimit, 9950);
+        governor.setRosterSize(500);
+        governor.configurePolicy({ enabled: true, total60s: 80, friend60s: 40, method60s: 30, rosterBonusPer100: 60 });
+        assert.equal(governor.getRequestProfile(at).totalLimit, 380);
+        governor.configurePolicy({ enabled: true, total60s: 80, friend60s: 40, method60s: 30, rosterBonusPer100: 0 });
+        assert.equal(governor.getRequestProfile(at).totalLimit, 80);
+    } finally { governor.resetForTest(); }
 });
 
 test('error slowdown never blocks heartbeat or login', () => {
